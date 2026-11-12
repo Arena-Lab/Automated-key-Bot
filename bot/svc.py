@@ -1,12 +1,13 @@
 """Core services: orders, payments, atomic inventory, delivery (bot/svc.py)"""
 
+import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 
-from pymongo import ReturnDocument
-
 from bot.db import Database
+from bot.oid import ObjectId
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -24,9 +25,20 @@ def fmt_ist(dt: datetime) -> str:
     return dt.replace(tzinfo=timezone.utc).astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
 
 
+_settings_cache = {"ts": 0.0, "data": {}}
+_SETTINGS_TTL = 30.0  # seconds
+
+
 async def get_settings(db) -> Dict[str, Any]:
+    """Settings change rarely - cache briefly to avoid a DB hit per handler."""
+    now = time.monotonic()
+    if _settings_cache["data"] and now - _settings_cache["ts"] < _SETTINGS_TTL:
+        return _settings_cache["data"]
     cursor = db.settings.find({})
-    return {d["key"]: d.get("value") for d in await cursor.to_list(length=None)}
+    data = {d["key"]: d.get("value") for d in await cursor.to_list(length=None)}
+    _settings_cache["ts"] = now
+    _settings_cache["data"] = data
+    return data
 
 
 async def next_order_id(db) -> str:
@@ -34,7 +46,6 @@ async def next_order_id(db) -> str:
         {"_id": "order"},
         {"$inc": {"seq": 1}},
         upsert=True,
-        return_document=ReturnDocument.AFTER,
     )
     return f"KS{doc['seq']:06d}"
 
@@ -59,14 +70,14 @@ async def create_order(user: Dict, product: Dict, plan: Dict, db) -> Dict:
         "created_at": now_utc(),
         "updated_at": now_utc(),
     }
-    res = await db.orders.insert_one(order)
-    order["_id"] = res.inserted_id
+    order_oid = ObjectId()
+    order["_id"] = order_oid
 
     # NOTE: do NOT include utr/screenshot keys here - the legacy unique sparse
     # index on payments.utr treats null as a value and would collide.
     s = await get_settings(db)
     payment = {
-        "order_id": res.inserted_id,
+        "order_id": order_oid,
         "public_order_id": order_id,
         "user_id": user["_id"],
         "telegram_id": user["telegram_id"],
@@ -77,7 +88,11 @@ async def create_order(user: Dict, product: Dict, plan: Dict, db) -> Dict:
         "created_at": now_utc(),
         "updated_at": now_utc(),
     }
-    await db.payments.insert_one(payment)
+    # Insert order + payment in parallel - one round-trip instead of two
+    await asyncio.gather(
+        db.orders.insert_one(order),
+        db.payments.insert_one(payment),
+    )
     order["payment"] = payment
     return order
 
@@ -150,6 +165,11 @@ async def approve_payment(db, order: Dict, admin_telegram_id: int) -> Optional[D
                   "approved_by": admin_telegram_id}},
     )
 
+    # keep the in-memory order in sync so delivery shows the key
+    order["status"] = "paid"
+    order["key_id"] = key["_id"]
+    order["key_value"] = key["key_value"]
+
     product = await db.products.find_one({"_id": order["product_id"]})
     return {"key": key, "product": product, "order": order}
 
@@ -175,7 +195,9 @@ async def expire_due_payments(db):
         await db.payments.update_one(
             {"_id": pay["_id"]},
             {"$set": {"status": "expired", "updated_at": now,
-                      "expiry_notified": True}},
+                      "expiry_notified": True},
+             # Release the UTR from the unique index so it can be reused
+             "$unset": {"utr": ""}},
         )
         if pay.get("public_order_id"):
             await db.orders.update_one(
@@ -191,15 +213,27 @@ async def product_stock_total(db, product_id) -> int:
     })
 
 
+def _norm_id(v) -> str:
+    if isinstance(v, dict):
+        v = v.get("$oid") or v.get("_id") or ""
+    s = str(v).strip().strip("'\"")
+    if s.startswith("ObjectId(") and s.endswith(")"):
+        s = s[9:-1].strip("'\"")
+    return s
+
+
 async def enrich_plans(db, product_id) -> list:
-    plans = await db.plans.find({
-        "product_id": product_id, "status": "active"
-    }).sort("price", 1).to_list(length=50)
-    out = []
-    for p in plans:
-        p["stock"] = await stock_for_plan(db, p["_id"])
-        out.append(p)
-    return out
+    all_plans = await db.plans.find({}).to_list(500)
+    target = _norm_id(product_id)
+    plans = [p for p in all_plans
+             if _norm_id(p.get("product_id") or p.get("productId") or p.get("pid")) == target
+             and p.get("status", "active") == "active"]
+    plans.sort(key=lambda p: p.get("price") or 0)
+    # Parallel stock counts - one round-trip total instead of N sequential
+    counts = await asyncio.gather(*[stock_for_plan(db, p["_id"]) for p in plans])
+    for p, c in zip(plans, counts):
+        p["stock"] = c
+    return plans
 
 
 # ---------------- Delivery ----------------
@@ -245,15 +279,28 @@ async def deliver_order(bot, db, order: Dict, product: Dict) -> bool:
     tid = order["telegram_id"]
     oid = order["order_id"]
 
-    await bot.send_message(
-        tid,
-        "🔑 <b>YOUR LICENSE KEY</b>\n\n"
-        f"🎮 {_esc(order.get('product_name',''))}\n"
-        f"⏱️ {_esc(order.get('plan_name',''))}\n\n"
-        f"<code>{_esc(order.get('key_value','N/A'))}</code>\n\n"
-        f"🆔 Order: {oid}",
-        parse_mode="HTML",
-    )
+    try:
+        await bot.send_message(
+            tid,
+            "🔑 <b>YOUR LICENSE KEY</b>\n\n"
+            f"🎮 {_esc(order.get('product_name',''))}\n"
+            f"⏱️ {_esc(order.get('plan_name',''))}\n\n"
+            f"<code>{_esc(order.get('key_value','N/A'))}</code>\n\n"
+            f"🆔 Order: {oid}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        # User unreachable (blocked bot etc.) - release the key back to
+        # stock and keep order 'paid' so admin can retry delivery
+        logger.error(f"Key delivery failed for {oid}: {e}")
+        if order.get("key_id"):
+            await db.keys.update_one(
+                {"_id": order["key_id"]},
+                {"$set": {"status": "available"}, "$unset": {"sold_at": ""}})
+        await db.orders.update_one(
+            {"_id": order["_id"]},
+            {"$set": {"status": "paid", "updated_at": now_utc()}})
+        return False
 
     await resend_product_files(bot, tid, product or {})
 
@@ -276,6 +323,14 @@ async def deliver_order(bot, db, order: Dict, product: Dict) -> bool:
                   "updated_at": now_utc()}},
     )
     return True
+
+
+async def release_order_key(db, order: Dict):
+    """Return an allocated key to stock (e.g. approval rolled back)."""
+    if order.get("key_id"):
+        await db.keys.update_one(
+            {"_id": order["key_id"]},
+            {"$set": {"status": "available"}, "$unset": {"sold_at": ""}})
 
 
 def _esc(s) -> str:

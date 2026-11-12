@@ -30,6 +30,7 @@ class AuthMiddleware(BaseMiddleware):
         db = Database.get_db()
         now = datetime.utcnow()
 
+        # Upsert user, then fetch the fresh doc
         await db.users.update_one(
             {"telegram_id": user.id},
             {
@@ -48,10 +49,10 @@ class AuthMiddleware(BaseMiddleware):
             },
             upsert=True,
         )
-
         doc = await db.users.find_one(
             {"telegram_id": user.id},
-            {"is_blocked": 1, "is_admin": 1, "_id": 1},
+            {"is_blocked": 1, "is_admin": 1, "telegram_id": 1,
+             "username": 1, "first_name": 1, "last_name": 1},
         )
         if not doc:
             return await handler(event, data)
@@ -66,6 +67,10 @@ class AuthMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+_maint_cache = {"ts": 0.0, "on": False}
+_MAINT_TTL = 10.0  # seconds - avoids a DB hit on every single update
+
+
 class MaintenanceMiddleware(BaseMiddleware):
     """Blocks customer actions during maintenance (admins always pass)."""
 
@@ -75,9 +80,18 @@ class MaintenanceMiddleware(BaseMiddleware):
         if not isinstance(event, (Message, CallbackQuery)):
             return await handler(event, data)
 
-        db = Database.get_db()
-        doc = await db.settings.find_one({"key": "maintenance_mode"})
-        if doc and doc.get("value") is True:
+        import time
+        now = time.monotonic()
+        if now - _maint_cache["ts"] < _MAINT_TTL:
+            maint_on = _maint_cache["on"]
+        else:
+            db = Database.get_db()
+            doc = await db.settings.find_one({"key": "maintenance_mode"})
+            maint_on = bool(doc and doc.get("value") is True)
+            _maint_cache["ts"] = now
+            _maint_cache["on"] = maint_on
+
+        if maint_on:
             if isinstance(event, Message):
                 await event.answer("🔧 Bot is under maintenance. Please try later.")
             else:

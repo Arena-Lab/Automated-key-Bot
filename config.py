@@ -15,15 +15,12 @@ class Config:
         map(int, filter(None, os.getenv("ADMIN_IDS", "").split(",")))
     )
 
-    # Database Configuration
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
-    DATABASE_NAME: str = os.getenv("DATABASE_NAME", "key_shop_bot")
-
     # Payment Configuration
     PAYMENT_MODE: str = os.getenv("PAYMENT_MODE", "manual")  # manual or automatic
     UPI_ID: str = os.getenv("UPI_ID", "")
     PAYEE_NAME: str = os.getenv("PAYEE_NAME", "")
     PAYMENT_VALIDITY_MINUTES: int = int(os.getenv("PAYMENT_VALIDITY_MINUTES", "10"))
+    PAYMENT_INSTRUCTIONS: str = os.getenv("PAYMENT_INSTRUCTIONS", "")
     PAYMENT_VERIFICATION_GROUP_ID: int = int(
         os.getenv("PAYMENT_VERIFICATION_GROUP_ID", "0")
     )
@@ -51,6 +48,4 @@ class Config:
             raise ValueError("BOT_TOKEN is required")
         if not cls.ADMIN_IDS:
             raise ValueError("ADMIN_IDS is required")
-        if not cls.DATABASE_URL:
-            raise ValueError("DATABASE_URL is required")
         return True

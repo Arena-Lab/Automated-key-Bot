@@ -1,5 +1,5 @@
-"""Database access - re-exports the proven connection layer"""
+"""Database access - JSON file storage engine (replaces MongoDB)"""
 
-from bot.database.connection import Database
+from bot.store import Database, get_store
 
-__all__ = ["Database"]
+__all__ = ["Database", "get_store"]

@@ -10,11 +10,10 @@ class CustomerStates(StatesGroup):
 
 class AdminStates(StatesGroup):
     product_name = State()
-    product_image = State()
-    product_desc = State()
-    product_plan_name = State()
-    product_plan_price = State()
-    product_plan_hours = State()
+    product_platform = State()
+    product_plans_pick = State()
+    product_plans_prices = State()
+    product_plans_custom = State()
     adding_keys = State()
     edit_field = State()
     edit_field_img = State()
@@ -30,4 +29,5 @@ class AdminStates(StatesGroup):
     link_url = State()
     tutorial_video = State()
     broadcast_content = State()
+    broadcast_link = State()
     edit_setting = State()

@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 async def global_error_handler(event: ErrorEvent):
     exc = event.exception
     update = event.update
+    # Stale inline buttons clicked after a restart - harmless, ignore quietly
+    msg = str(exc)
+    if "query is too old" in msg or "query ID is invalid" in msg \
+            or "message is not modified" in msg:
+        logger.debug("Stale callback ignored: %s", msg)
+        return
     logger.error("Unhandled error: %s", exc, exc_info=exc)
     try:
         if update.message:
@@ -44,6 +50,14 @@ async def payment_expiry_job(bot: Bot):
             db = Database.get_db()
             expired = await svc.expire_due_payments(db)
             for p in expired:
+                # Delete the payment/QR message if we stored its id
+                if p.get("payment_msg_id"):
+                    try:
+                        await bot.delete_message(
+                            p.get("payment_chat_id", p["telegram_id"]),
+                            p["payment_msg_id"])
+                    except Exception:
+                        pass
                 try:
                     await bot.send_message(
                         p["telegram_id"],
@@ -103,17 +117,23 @@ async def main():
     dp.include_router(admin.router)
     dp.include_router(reseller.router)
 
-    # Expiry job
+    # Expiry job + automatic backups (every 6h)
     expiry_task = asyncio.create_task(payment_expiry_job(bot))
+    from bot.store import get_store
+    backup_task = asyncio.create_task(get_store().backup_loop())
 
     logger.info("Bot started successfully!")
     try:
         await dp.start_polling(bot)
     finally:
         expiry_task.cancel()
+        backup_task.cancel()
         await Database.close()
         await bot.session.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nBot stopped.")

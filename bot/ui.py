@@ -12,6 +12,13 @@ def _ikb(rows: List[List[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def platform_icon(platform: str) -> str:
+    return {
+        "Android": "🤖", "iOS": "🍎", "Both": "💻",
+        "iPad": "📱", "iPhone": "📱",
+    }.get(platform or "", "🎮")
+
+
 class KB:
     # ---------- Customer ----------
 
@@ -35,7 +42,7 @@ class KB:
             label = p["name"] if stock > 0 else f"{p['name']} (Out of Stock)"
             rows.append([InlineKeyboardButton(
                 text=f"🎮 {label}",
-                callback_data=f"prod_{p['_id']}" if stock > 0 else "noop",
+                callback_data=f"prod_{p['_id']}",
             )])
         return _ikb(rows)
 
@@ -43,11 +50,13 @@ class KB:
     def plans(plans: List[Dict[str, Any]], product_id: str) -> InlineKeyboardMarkup:
         rows, row = [], []
         for pl in plans:
-            stock = pl.get("stock", 0)
-            text = f"⏱️ {pl['name']} - ₹{pl['price']}" + ("" if stock > 0 else " 🔴")
+            try:
+                price = f"{float(pl['price']):g}"
+            except (TypeError, ValueError):
+                price = str(pl["price"])
             row.append(InlineKeyboardButton(
-                text=text,
-                callback_data=f"plan_{pl['_id']}" if stock > 0 else "noop",
+                text=f"⏱️ {pl['name']} - ₹{price}",
+                callback_data=f"plan_{pl['_id']}",
             ))
             if len(row) == 2:
                 rows.append(row); row = []
@@ -81,18 +90,17 @@ class KB:
     @staticmethod
     def admin_dashboard() -> InlineKeyboardMarkup:
         return _ikb([
-            [InlineKeyboardButton(text="📊 Statistics", callback_data="adm_stats")],
-            [InlineKeyboardButton(text="🛍️ Products", callback_data="adm_products")],
-            [InlineKeyboardButton(text="🔑 Keys", callback_data="adm_keys")],
-            [InlineKeyboardButton(text="💳 Payments", callback_data="adm_payments")],
-            [InlineKeyboardButton(text="📦 Orders", callback_data="adm_orders")],
-            [InlineKeyboardButton(text="👥 Customers", callback_data="adm_customers")],
-            [InlineKeyboardButton(text="📁 Files & Links", callback_data="adm_files")],
-            [InlineKeyboardButton(text="📢 Broadcast", callback_data="adm_broadcast")],
+            [InlineKeyboardButton(text="📊 Stats", callback_data="adm_stats"),
+             InlineKeyboardButton(text="🛍️ Products", callback_data="adm_products")],
+            [InlineKeyboardButton(text="💳 Payments", callback_data="adm_payments"),
+             InlineKeyboardButton(text="📦 Orders", callback_data="adm_orders")],
+            [InlineKeyboardButton(text="🔑 Keys", callback_data="adm_keys"),
+             InlineKeyboardButton(text="👥 Customers", callback_data="adm_customers")],
+            [InlineKeyboardButton(text="📁 Files", callback_data="adm_files"),
+             InlineKeyboardButton(text="📢 Broadcast", callback_data="adm_broadcast")],
             [InlineKeyboardButton(text="⚙️ Settings", callback_data="adm_settings")],
-            [InlineKeyboardButton(text="🛡️ Admins", callback_data="adm_admins")],
-            [InlineKeyboardButton(text="🔄 Restart Bot", callback_data="adm_restart")],
-            [InlineKeyboardButton(text="🚪 Exit", callback_data="adm_exit")],
+            [InlineKeyboardButton(text="🔄 Restart", callback_data="adm_restart"),
+             InlineKeyboardButton(text="🚪 Exit", callback_data="adm_exit")],
         ])
 
     @staticmethod
@@ -101,7 +109,7 @@ class KB:
         for p in products:
             flag = "🟢" if p.get("status") == "active" else "🔴"
             rows.append([InlineKeyboardButton(
-                text=f"{flag} {p['name']}",
+                text=f"{flag} {platform_icon(p.get('platform'))} {p['name']}",
                 callback_data=f"adm_prod_{p['_id']}",
             )])
         rows.append([
@@ -130,7 +138,8 @@ class KB:
              InlineKeyboardButton(text="📝 Description", callback_data=f"adm_f_desc_{pid}")],
             [InlineKeyboardButton(text="🖼 Image", callback_data=f"adm_f_img_{pid}"),
              InlineKeyboardButton(text="📊 Order", callback_data=f"adm_f_ord_{pid}")],
-            [InlineKeyboardButton(text="🟢/🔴 Toggle", callback_data=f"adm_f_toggle_{pid}")],
+            [InlineKeyboardButton(text="📱 Platform", callback_data=f"adm_f_plat_{pid}"),
+             InlineKeyboardButton(text="🟢/🔴 Toggle", callback_data=f"adm_f_toggle_{pid}")],
             [InlineKeyboardButton(text="🔙 Product", callback_data=f"adm_prod_{pid}")],
         ])
 
@@ -138,8 +147,7 @@ class KB:
     def plan_detail(plan_id: str, product_id: str) -> InlineKeyboardMarkup:
         return _ikb([
             [InlineKeyboardButton(text="✏️ Name", callback_data=f"adm_q_name_{plan_id}"),
-             InlineKeyboardButton(text="💰 Price", callback_data=f"adm_q_price_{plan_id}"),
-             InlineKeyboardButton(text="⏱ Hours", callback_data=f"adm_q_hours_{plan_id}")],
+             InlineKeyboardButton(text="💰 Price", callback_data=f"adm_q_price_{plan_id}")],
             [InlineKeyboardButton(text="🟢/🔴 Toggle", callback_data=f"adm_q_toggle_{plan_id}")],
             [InlineKeyboardButton(text="🗑 Delete", callback_data=f"adm_q_del_{plan_id}")],
             [InlineKeyboardButton(text="🔙 Plans", callback_data=f"adm_plans_{product_id}")],
@@ -150,7 +158,8 @@ class KB:
         return _ikb([
             [InlineKeyboardButton(text="✅ Approve", callback_data=f"ver_ok_{order_id}"),
              InlineKeyboardButton(text="❌ Reject", callback_data=f"ver_no_{order_id}")],
-            [InlineKeyboardButton(text="👤 Customer", callback_data=f"ver_cust_{order_id}")],
+            [InlineKeyboardButton(text="👤 Customer", callback_data=f"ver_cust_{order_id}"),
+             InlineKeyboardButton(text="🔙 Dashboard", callback_data="adm_dash")],
         ])
 
     @staticmethod
@@ -166,7 +175,8 @@ class KB:
              InlineKeyboardButton(text="🔧 Maintenance Msg", callback_data="set_maint")],
             [InlineKeyboardButton(text="🔴 How to Buy Text", callback_data="set_howto")],
             [InlineKeyboardButton(text="💳 Payment Mode", callback_data="adm_paymode"),
-             InlineKeyboardButton(text="🔧 Maintenance ON/OFF", callback_data="adm_maintoggle")],
+             InlineKeyboardButton(text="📣 Payment Alerts", callback_data="adm_notifytarget")],
+            [InlineKeyboardButton(text="🔧 Maintenance ON/OFF", callback_data="adm_maintoggle")],
             [InlineKeyboardButton(text="🔙 Dashboard", callback_data="adm_dash")],
         ])
 
