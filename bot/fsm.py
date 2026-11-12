@@ -30,4 +30,6 @@ class AdminStates(StatesGroup):
     tutorial_video = State()
     broadcast_content = State()
     broadcast_link = State()
+    promo_text = State()
+    revenue_edit = State()
     edit_setting = State()

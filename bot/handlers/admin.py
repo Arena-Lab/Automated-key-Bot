@@ -52,31 +52,8 @@ async def _log(db, admin_id, action, details=None):
 
 
 async def _dash_text(db) -> str:
-    s = await svc.get_settings(db)
-    users = await db.users.count_documents({})
-    products = await db.products.count_documents({})
-    active_products = await db.products.count_documents({"status": "active"})
-    avail = await db.keys.count_documents({"status": "available"})
-    sold = await db.keys.count_documents({"status": "sold"})
-    pending = await db.payments.count_documents({"status": "pending"})
-    rev = await db.orders.aggregate([
-        {"$match": {"status": {"$in": ["paid", "delivered"]}}},
-        {"$group": {"_id": None, "t": {"$sum": "$amount"}}},
-    ]).to_list(1)
-    today = svc.now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
-    trev = await db.orders.aggregate([
-        {"$match": {"status": {"$in": ["paid", "delivered"]}, "created_at": {"$gte": today}}},
-        {"$group": {"_id": None, "t": {"$sum": "$amount"}}},
-    ]).to_list(1)
-    maint = "🔴 ON" if s.get("maintenance_mode") else "🟢 OFF"
-    return (
-        "⚜️ <b>KEY SHOP CONTROL PANEL</b>\n\n"
-        f"👥 Users: {users} | 🛍️ Products: {active_products}/{products}\n"
-        f"🔑 Keys: {avail} avail / {sold} sold | ⏳ Pending: {pending}\n"
-        f"💰 Revenue: ₹{(rev[0]['t'] if rev else 0):.2f} "
-        f"(today ₹{(trev[0]['t'] if trev else 0):.2f})\n"
-        f"💳 Mode: {s.get('payment_mode','manual')} | 🔧 Maint: {maint}"
-    )
+    # Stats live in the Stats section only - dashboard stays clean
+    return "⚜️ <b>KEY SHOP CONTROL PANEL</b>\n\nUse the buttons below to manage the shop."
 
 
 async def _send_dash(message, db):
@@ -89,6 +66,13 @@ async def _send_dash(message, db):
 @router.message(F.text == "/admin")
 async def cmd_admin(message: types.Message, db):
     await _send_dash(message, db)
+
+
+@router.message(F.text == "/settings")
+async def cmd_settings(message: types.Message, db):
+    # admin_guard middleware restricts this to admins only
+    await message.answer("⚙️ <b>BOT SETTINGS</b>", parse_mode="HTML",
+                         reply_markup=await _settings_kb(db))
 
 
 @router.callback_query(F.data == "adm_dash")
@@ -130,20 +114,100 @@ async def cb_stats(callback: types.CallbackQuery, db):
         ]).to_list(1)
         return r[0]["t"] if r else 0
 
+    s = await svc.get_settings(db)
+    manual_rev = s.get("revenue_manual")
+
+    def inr(v):
+        return f"₹{v:,.2f}"
+
+    total_rev = float(manual_rev) if manual_rev is not None else await rev_since(datetime(2020,1,1))
+    rev_line = f"💰 Total Revenue   <b>{inr(total_rev)}</b>"
+    if manual_rev is not None:
+        rev_line += "  <i>(manual override)</i>"
+    maint = "🔴 ON" if s.get("maintenance_mode") else "🟢 OFF"
+    mode = "🤖 Automatic" if s.get("payment_mode") == "automatic" else "✋ Manual"
     await callback.message.edit_text(
-        "📊 <b>STATISTICS</b>\n\n"
-        f"👥 Users: {await db.users.count_documents({})}\n"
-        f"🛍️ Products: {await db.products.count_documents({})} "
+        "📊 <b>STATISTICS</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Users          <b>{await db.users.count_documents({})}</b>\n"
+        f"🛍️ Products       <b>{await db.products.count_documents({})}</b> "
         f"({await db.products.count_documents({'status':'active'})} active)\n"
-        f"🔑 Keys: {await db.keys.count_documents({'status':'available'})} avail / "
-        f"{await db.keys.count_documents({'status':'sold'})} sold\n"
-        f"📦 Orders: {await db.orders.count_documents({})}\n"
-        f"💳 Pending: {await db.payments.count_documents({'status':'pending'})} | "
-        f"✅ Approved: {await db.payments.count_documents({'status':'approved'})} | "
-        f"❌ Rejected: {await db.payments.count_documents({'status':'rejected'})}\n"
-        f"💰 Revenue: ₹{await rev_since(datetime(2020,1,1)):.2f} | "
-        f"Today ₹{await rev_since(day):.2f} | Month ₹{await rev_since(month):.2f}",
-        parse_mode="HTML", reply_markup=KB.back_nav("adm_dash", "🔙 Dashboard"))
+        f"🔑 Keys           <b>{await db.keys.count_documents({'status':'available'})}</b> avail / "
+        f"<b>{await db.keys.count_documents({'status':'sold'})}</b> sold\n"
+        f"📦 Orders         <b>{await db.orders.count_documents({})}</b>\n\n"
+        f"⏳ Pending        <b>{await db.payments.count_documents({'status':'pending'})}</b>\n"
+        f"✅ Approved       <b>{await db.payments.count_documents({'status':'approved'})}</b>\n"
+        f"❌ Rejected       <b>{await db.payments.count_documents({'status':'rejected'})}</b>\n\n"
+        f"{rev_line}\n"
+        f"📅 Today          <b>{inr(await rev_since(day))}</b>\n"
+        f"🗓 Month          <b>{inr(await rev_since(month))}</b>\n\n"
+        f"💳 Payment Mode   <b>{mode}</b>\n"
+        f"🔧 Maintenance    <b>{maint}</b>",
+        parse_mode="HTML", reply_markup=_kb([
+            [InlineKeyboardButton(text="✏️ Edit Revenue", callback_data="adm_revset")],
+            [InlineKeyboardButton(text="🔙 Dashboard", callback_data="adm_dash")],
+        ]))
+
+
+@router.callback_query(F.data == "adm_revset")
+async def cb_revset(callback: types.CallbackQuery, state: FSMContext, db):
+    await callback.answer()
+    now = svc.now_utc()
+    day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    async def rev(since):
+        r = await db.orders.aggregate([
+            {"$match": {"status": {"$in": ["paid", "delivered"]},
+                        "created_at": {"$gte": since}}},
+            {"$group": {"_id": None, "t": {"$sum": "$amount"}}},
+        ]).to_list(1)
+        return r[0]["t"] if r else 0
+
+    s = await svc.get_settings(db)
+    man = s.get("revenue_manual")
+    total_c = await rev(datetime(2020, 1, 1))
+    shown = float(man) if man is not None else total_c
+    mode_txt = "manual override" if man is not None else "auto (order-computed)"
+    await state.set_state(AdminStates.revenue_edit)
+    await callback.message.edit_text(
+        "💰 <b>EDIT REVENUE</b>\n\n"
+        f"📊 Current total: <b>₹{shown:,.2f}</b> ({mode_txt})\n"
+        f"🧮 Computed from orders: ₹{total_c:,.2f}\n"
+        f"📅 Today: ₹{await rev(day):,.2f} | 🗓 Month: ₹{await rev(month):,.2f}\n\n"
+        "Send the new <b>total revenue</b> (grows automatically with new orders):\n"
+        "<code>12500</code>\n\n"
+        "Send <code>auto</code> to go back to order-computed revenue.",
+        parse_mode="HTML")
+
+
+@router.message(AdminStates.revenue_edit, F.text)
+async def st_revset(m, state, db):
+    text = m.text.strip().lower()
+    if text == "auto":
+        await db.settings.update_one({"key": "revenue_manual"},
+            {"$unset": {"value": ""}})
+        svc.invalidate_settings()
+        await state.clear()
+        await m.answer("✅ Revenue back to auto (order-computed).",
+                       reply_markup=KB.back_nav("adm_stats", "🔙 Stats"))
+        return
+    try:
+        val = float(m.text.strip())
+        if val < 0:
+            raise ValueError
+    except ValueError:
+        await m.answer("❌ Invalid amount — send a number (e.g. 12500) or 'auto'.")
+        return
+    await db.settings.update_one({"key": "revenue_manual"},
+        {"$set": {"key": "revenue_manual", "value": val,
+                  "updated_at": svc.now_utc()}}, upsert=True)
+    svc.invalidate_settings()
+    await _log(db, m.from_user.id, "edit_revenue", {"value": val})
+    await state.clear()
+    await m.answer(f"✅ Total revenue set to ₹{val:.2f} <i>(manual)</i>",
+                   parse_mode="HTML",
+                   reply_markup=KB.back_nav("adm_stats", "🔙 Stats"))
 
 
 # ================= Products =================
@@ -475,18 +539,56 @@ async def cb_prod_detail(callback: types.CallbackQuery, db):
     plan_txt = "\n".join(
         f"• {_esc(x['name'])} — ₹{x['price']}"
         for x in plans) or "none"
+    files = p.get("files", {}) or {}
+    apk_ok = bool(files.get("apk", {}).get("file_id") or p.get("apk_file_id"))
+    vid_ok = bool(files.get("video", {}).get("file_id") or p.get("setup_video_file_id"))
     plat = p.get("platform") or "-"
     await callback.message.edit_text(
         f"🎮 <b>{_esc(p['name'])}</b> {'🟢' if p.get('status')=='active' else '🔴'}\n\n"
         f"📱 Platform: {_esc(plat)}\n"
         f"{_esc(p.get('description') or '')}\n\n"
-        f"⏱️ Plans ({len(plans)}):\n{plan_txt}\n\n🔑 Stock: {stock}",
+        f"⏱️ Plans ({len(plans)}):\n{plan_txt}\n\n"
+        f"🔑 Stock: {stock}\n"
+        f"📁 APK {'✅' if apk_ok else '❌'} | Video {'✅' if vid_ok else '❌'}",
         parse_mode="HTML", reply_markup=KB.product_detail(str(pid)))
+
+
+@router.callback_query(F.data.startswith("adm_pview_"))
+async def cb_prod_view(callback: types.CallbackQuery, db):
+    pid = callback.data[10:]  # "adm_pview_" is 10 chars
+    await callback.answer()
+    try:
+        p = await db.products.find_one({"_id": ObjectId(pid)})
+    except Exception:
+        p = None
+    if not p:  # fallback for migrated docs with non-ObjectId ids
+        for doc in await db.products.find({}).to_list(500):
+            if _norm_id(doc.get("_id")) == pid:
+                p = doc
+                break
+    if not p:
+        await callback.message.edit_text("❌ Not found.")
+        return
+    plans = await _plans_of(db, pid)
+    stock = await svc.product_stock_total(db, pid)
+    plan_txt = "\n".join(
+        f"• {_esc(x['name'])} — ₹{x['price']}" for x in plans) or "none"
+    files = p.get("files", {}) or {}
+    apk_ok = bool(files.get("apk", {}).get("file_id") or p.get("apk_file_id"))
+    vid_ok = bool(files.get("video", {}).get("file_id") or p.get("setup_video_file_id"))
+    await callback.message.edit_text(
+        f"👁 <b>PREVIEW — {_esc(p['name'])}</b>\n\n"
+        f"{_esc(p.get('description') or '')}\n\n"
+        f"⏱️ Plans:\n{plan_txt}\n\n🔑 Available stock: {stock}\n"
+        f"📁 APK {'✅' if apk_ok else '❌'} | Video {'✅' if vid_ok else '❌'}\n\n"
+        "<i>This is what customers see.</i>",
+        parse_mode="HTML",
+        reply_markup=KB.back_nav(f"adm_prod_{pid}", "🔙 Product"))
 
 
 # ---- product field edits ----
 
-FIELD_LABELS = {"name": "name", "desc": "description", "img": "image",
+FIELD_LABELS = {"name": "name", "desc": "description",
                 "ord": "display order", "toggle": "status", "plat": "platform"}
 
 
@@ -511,12 +613,6 @@ async def cb_prod_field(callback: types.CallbackQuery, state: FSMContext, db):
             {"$set": {"status": new, "updated_at": svc.now_utc()}})
         await _log(db, callback.from_user.id, "toggle_product", {"id": pid})
         await callback.message.edit_text(f"Product {'🟢 enabled' if new=='active' else '🔴 disabled'}.")
-        return
-
-    if field == "img":
-        await state.set_state(AdminStates.edit_field_img)
-        await state.update_data(pid=pid)
-        await callback.message.edit_text("🖼 Send new product <b>image</b> (photo):", parse_mode="HTML")
         return
 
     await state.set_state(AdminStates.edit_field)
@@ -545,15 +641,6 @@ async def st_edit_field(m: types.Message, state: FSMContext, db):
                    reply_markup=KB.back_nav(f"adm_prod_{pid}", "🔙 Product"))
 
 
-@router.message(AdminStates.edit_field_img, F.photo)
-async def st_edit_img(m: types.Message, state: FSMContext, db):
-    data = await state.get_data()
-    await db.products.update_one({"_id": ObjectId(data["pid"])},
-        {"$set": {"image_file_id": m.photo[-1].file_id, "updated_at": svc.now_utc()}})
-    await state.clear()
-    await m.answer("✅ Image updated.", reply_markup=KB.back_nav(f"adm_prod_{data['pid']}", "🔙 Product"))
-
-
 @router.callback_query(F.data.startswith("adm_pdel_"))
 async def cb_prod_del(callback: types.CallbackQuery, db):
     pid = callback.data[9:]  # "adm_pdel_" is 9 chars
@@ -578,24 +665,6 @@ async def cb_prod_del_ok(callback: types.CallbackQuery, db):
     await _log(db, callback.from_user.id, "delete_product", {"id": pid})
     await callback.answer("Deleted.")
     await callback.message.edit_text("✅ Product deleted.", reply_markup=KB.back_nav("adm_products", "🔙 Products"))
-
-
-@router.callback_query(F.data.startswith("adm_pview_"))
-async def cb_prod_view(callback: types.CallbackQuery, db):
-    pid = callback.data[9:]  # "adm_pview_" is 9 chars
-    await callback.answer()
-    p = await db.products.find_one({"_id": ObjectId(pid)})
-    if not p:
-        await callback.message.edit_text("❌ Not found.")
-        return
-    text = f"🎮 <b>{_esc(p['name'])}</b>\n\n{_esc(p.get('description') or '')}"
-    if p.get("image_file_id"):
-        try:
-            await callback.message.answer_photo(p["image_file_id"], caption=text, parse_mode="HTML")
-            return
-        except Exception:
-            pass
-    await callback.message.edit_text(text, parse_mode="HTML")
 
 
 # ================= Plans =================
@@ -831,23 +900,40 @@ async def cb_key_plan(callback: types.CallbackQuery, state: FSMContext, db):
         "🔑 Send keys — <b>comma or newline separated</b>, single or bulk:\n\n"
         "<code>KEY-AAAA-1111, KEY-BBBB-2222</code>\n"
         "<code>KEY-CCCC-3333\nKEY-DDDD-4444</code>\n\n"
-        "Send 'done' or tap ✅ Done when finished.",
-        parse_mode="HTML",
-        reply_markup=_kb([[InlineKeyboardButton(
-            text="✅ Done Adding Keys", callback_data=f"adm_keydone_{pid}")]]))
+        "Type 'done' when finished.",
+        parse_mode="HTML")
 
 
 @router.message(AdminStates.adding_keys, F.text)
 async def st_add_keys(m, state, db):
     text = m.text.strip()
     if text.lower() in ("done", "finish", "exit"):
-        pid = (await state.get_data()).get("pid") or ""
+        data = await state.get_data()
+        pid = data.get("pid") or ""
         await state.clear()
-        await m.answer("✅ Key entry finished.",
-                       reply_markup=KB.back_nav(f"adm_pkeys_{pid}", "🔙 Inventory") if pid
-                       else KB.back_nav("adm_products", "🔙 Products"))
+        # same flow as the Done button - back to plan picker for this product
+        plans = await _plans_of(db, pid) if pid else []
+        if plans:
+            rows = [[InlineKeyboardButton(
+                    text=f"{'🟢' if pl.get('status','active')=='active' else '🔴'} "
+                         f"⏱️ {pl['name']} (₹{pl['price']})",
+                    callback_data=f"adm_keyplan_{_cbid(pl['_id'])}")] for pl in plans]
+            rows.append([InlineKeyboardButton(text="🔙 Product", callback_data=f"adm_prod_{pid}")])
+            await m.answer("✅ Key entry finished. Select a plan to add more keys:",
+                           reply_markup=_kb(rows))
+        else:
+            await m.answer("✅ Key entry finished.",
+                           reply_markup=KB.back_nav(f"adm_prod_{pid}", "🔙 Product") if pid
+                           else KB.back_nav("adm_products", "🔙 Products"))
         return
     data = await state.get_data()
+    # delete the previous prompt/reply so Done buttons never stack up
+    prev = data.get("last_msg")
+    if prev:
+        try:
+            await m.bot.delete_message(m.chat.id, prev)
+        except Exception:
+            pass
     # commas, newlines, spaces - all treated as separators; each key stored individually
     keys = [k.strip().upper() for k in re.split(r"[,\n\r]+", text) if k.strip()]
     # also split on whitespace if no commas/newlines were used
@@ -859,13 +945,13 @@ async def st_add_keys(m, state, db):
         return
     plan_oid = ObjectId(data["plan_id"])
     pid = ObjectId(data["pid"])
-    # skip keys already in inventory - no duplicates/leakage
+    # skip keys already in inventory - duplicates get individual add/skip prompts
     existing = {k["key_value"] for k in
                 await db.keys.find({"plan_id": plan_oid}).to_list(500)}
-    added = skipped = 0
+    dups = [kv for kv in keys if kv in existing]
+    added = 0
     for kv in keys:
         if kv in existing:
-            skipped += 1
             continue
         await db.keys.insert_one({
             "product_id": pid, "plan_id": plan_oid,
@@ -875,13 +961,29 @@ async def st_add_keys(m, state, db):
         existing.add(kv)
         added += 1
     await _log(db, m.from_user.id, "add_keys",
-               {"plan": data["plan_id"], "added": added})
+               {"plan": data["plan_id"], "added": added, "dups": len(dups)})
+    # register pending duplicates in state, one message each
+    dups_map = dict(data.get("dups") or {})
+    for kv in dups:
+        code = hashlib.md5(f"{data['plan_id']}|{kv}".encode()).hexdigest()[:12]
+        dups_map[code] = {"kv": kv, "plan_id": data["plan_id"], "pid": data["pid"]}
+        await m.answer(
+            f"⚠️ <b>Duplicate key detected</b>\n\n<code>{_esc(kv)}</code>\n\n"
+            "Already exists in inventory. Add anyway or skip?",
+            parse_mode="HTML",
+            reply_markup=_kb([
+                [InlineKeyboardButton(text="✅ Add Anyway", callback_data=f"adm_dupadd_{code}"),
+                 InlineKeyboardButton(text="⏭ Skip", callback_data=f"adm_dupskip_{code}")],
+            ]))
+    if dups_map:
+        await state.update_data(dups=dups_map)
     # stay in state - admin can send more keys or press Done
-    await m.answer(
-        f"✅ Added {added} key(s)" + (f", skipped {skipped} duplicate(s)." if skipped else ".")
-        + "\n\nSend more keys, 'done', or tap ✅ Done below.",
-        reply_markup=_kb([[InlineKeyboardButton(
-            text="✅ Done Adding Keys", callback_data=f"adm_keydone_{data['pid']}")]]))
+    summary = f"✅ Added {added} key(s)"
+    if dups:
+        summary += f", {len(dups)} duplicate(s) — see prompts above."
+    summary += "\n\nSend more keys or type 'done'."
+    sent = await m.answer(summary)
+    await state.update_data(last_msg=sent.message_id)
 
 
 @router.callback_query(F.data.startswith("adm_keydone_"))
@@ -889,20 +991,19 @@ async def cb_key_done(callback: types.CallbackQuery, state: FSMContext, db):
     pid = callback.data[12:]
     await state.clear()
     await callback.answer("Done")
-    p = await db.products.find_one({"_id": ObjectId(pid)})
     plans = await _plans_of(db, pid)
-    rows = []
-    for pl in plans:
-        avail = await svc.stock_for_plan(db, pl["_id"])
-        sold = await db.keys.count_documents({"plan_id": pl["_id"], "status": "sold"})
-        icon = "🟢" if avail > 10 else ("🟡" if avail > 0 else "🔴")
-        rows.append([InlineKeyboardButton(
-            text=f"{icon} {pl['name']}: {avail} avail / {sold} sold",
-            callback_data=f"adm_inv_{_cbid(pl['_id'])}")])  # hashed - 64B limit
+    if not plans:
+        await callback.message.edit_text("✅ Keys added.",
+            reply_markup=KB.back_nav(f"adm_prod_{pid}", "🔙 Product"))
+        return
+    rows = [[InlineKeyboardButton(
+            text=f"{'🟢' if pl.get('status','active')=='active' else '🔴'} "
+                 f"⏱️ {pl['name']} (₹{pl['price']})",
+            callback_data=f"adm_keyplan_{_cbid(pl['_id'])}")] for pl in plans]
     rows.append([InlineKeyboardButton(text="🔙 Product", callback_data=f"adm_prod_{pid}")])
-    await callback.message.answer(
-        f"🔑 <b>INVENTORY — {_esc(p['name'] if p else '?')}</b>",
-        parse_mode="HTML", reply_markup=_kb(rows))
+    await callback.message.edit_text(
+        "✅ Keys added.\n\nSelect a plan to add keys to:",
+        reply_markup=_kb(rows))
 
 
 @router.callback_query(F.data.startswith("adm_inv_"))
@@ -924,54 +1025,16 @@ async def cb_inventory(callback: types.CallbackQuery, db):
             icon = "🟢"
         else:
             sold += 1
-            icon = "⚫"
+            icon = "🔒"
         rows.append([InlineKeyboardButton(
-            text=f"{icon} {k['key_value'][:28]} — {k.get('status')}",
+            text=f"{icon} {k['key_value'][:28]} — {'SOLD' if icon=='🔒' else 'avail'}",
             callback_data=f"adm_keydel_{_cbid(k['_id'])}")])  # hashed - 64B limit
-    rows.append([InlineKeyboardButton(text="🔍 Search Keys", callback_data="adm_keysearch")])
     rows.append([InlineKeyboardButton(text="🔙 Inventory", callback_data=f"adm_pkeys_{pid}")])
     await callback.message.edit_text(
         f"🔑 <b>{_esc(pl['name'] if pl else '?')} — INVENTORY</b>\n"
         f"🟢 {avail} available | ⚫ {sold} sold\n"
         "Tap a key to delete it (sold keys can't be deleted).",
         parse_mode="HTML", reply_markup=_kb(rows))
-
-
-@router.callback_query(F.data == "adm_keys")
-async def cb_keys_main(callback: types.CallbackQuery):
-    await callback.answer()
-    await callback.message.edit_text(
-        "🔑 <b>KEY MANAGEMENT</b>\n\nPick a product to view inventory, or search keys.",
-        parse_mode="HTML",
-        reply_markup=_kb([
-            [InlineKeyboardButton(text="🔍 Search Keys", callback_data="adm_keysearch")],
-            [InlineKeyboardButton(text="🔙 Dashboard", callback_data="adm_dash")],
-        ]))
-
-
-@router.callback_query(F.data == "adm_keysearch")
-async def cb_key_search(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await state.set_state(AdminStates.search_keys)
-    await callback.message.edit_text("🔍 Send key text to search (partial match):")
-
-
-@router.message(AdminStates.search_keys, F.text)
-async def st_search_keys(m, state, db):
-    q = m.text.strip()
-    await state.clear()
-    keys = await db.keys.find(
-        {"key_value": {"$regex": q, "$options": "i"}}).to_list(20)
-    if not keys:
-        await m.answer("No keys found.", reply_markup=KB.back_nav("adm_dash", "🔙 Dashboard"))
-        return
-    rows = []
-    for k in keys:
-        rows.append([InlineKeyboardButton(
-            text=f"{'🟢' if k.get('status')=='available' else '⚫'} {_esc(k['key_value'][:30])}",
-            callback_data=f"adm_keydel_{_cbid(k['_id'])}")])  # hashed - 64B limit
-    rows.append([InlineKeyboardButton(text="🔙 Dashboard", callback_data="adm_dash")])
-    await m.answer(f"🔍 {len(keys)} result(s):", reply_markup=_kb(rows))
 
 
 @router.callback_query(F.data.startswith("adm_keydel_"))
@@ -983,12 +1046,131 @@ async def cb_key_del(callback: types.CallbackQuery, db):
         await callback.message.edit_text("❌ Not found.")
         return
     if k.get("status") == "sold":
-        await callback.message.edit_text("⚠️ Key already sold — cannot delete.")
+        await callback.message.edit_text(
+            f"🔒 <b>Sold key</b>\n\n<code>{_esc(k['key_value'])}</code>\n\n"
+            "Unlock it to make it available again?\n"
+            "<i>(e.g. you bought it for testing)</i>",
+            parse_mode="HTML",
+            reply_markup=KB.yes_no(f"adm_kunlockok_{code}",
+                                   f"adm_inv_{_cbid(k['plan_id'])}"))
         return
+    await callback.message.edit_text(
+        f"⚠️ <b>Delete this key?</b>\n\n<code>{_esc(k['key_value'])}</code>\n\n"
+        "This permanently removes it from inventory.",
+        parse_mode="HTML",
+        reply_markup=KB.yes_no(f"adm_keydelok_{code}",
+                               f"adm_inv_{_cbid(k['plan_id'])}"))
+
+
+@router.callback_query(F.data.startswith("adm_keydelok_"))
+async def cb_key_del_ok(callback: types.CallbackQuery, db):
+    code = callback.data[13:]
+    await callback.answer("Deleted")
+    k = await _key_by_code(db, code)
+    if not k:
+        await callback.message.edit_text("❌ Not found.")
+        return
+    plan_code = _cbid(k["plan_id"])
     await db.keys.delete_one({"_id": k["_id"]})
     await _log(db, callback.from_user.id, "delete_key", {"id": str(k["_id"])})
-    await callback.message.edit_text(f"🗑 Key <code>{_esc(k['key_value'])}</code> deleted.",
-                                  parse_mode="HTML")
+    pl = await _plan_by_code(db, plan_code)
+    if not pl:
+        await callback.message.edit_text(
+            f"🗑 Key <code>{_esc(k['key_value'])}</code> deleted.",
+            parse_mode="HTML")
+        return
+    text, kb = await _plan_inventory(db, pl)
+    await callback.message.edit_text(
+        f"🗑 Deleted <code>{_esc(k['key_value'])}</code>\n\n" + text,
+        parse_mode="HTML", reply_markup=kb)
+
+
+async def _plan_inventory(db, pl):
+    """Shared inventory view: (text, keyboard) for a plan."""
+    keys = await db.keys.find({"plan_id": pl["_id"]}).sort("created_at", -1).to_list(25)
+    rows = []
+    avail = sold = 0
+    for kk in keys:
+        if kk.get("status") == "available":
+            avail += 1
+            icon, st = "🟢", "avail"
+        else:
+            sold += 1
+            icon, st = "🔒", "SOLD"
+        rows.append([InlineKeyboardButton(
+            text=f"{icon} {kk['key_value'][:28]} — {st}",
+            callback_data=f"adm_keydel_{_cbid(kk['_id'])}")])
+    pid = str(pl.get("product_id") or "")
+    rows.append([InlineKeyboardButton(text="🔙 Inventory", callback_data=f"adm_pkeys_{pid}")])
+    text = (f"🔑 <b>{_esc(pl['name'])} — INVENTORY</b>\n"
+            f"🟢 {avail} available | 🔒 {sold} sold")
+    return text, _kb(rows)
+
+
+@router.callback_query(F.data.startswith("adm_kunlockok_"))
+async def cb_key_unlock_ok(callback: types.CallbackQuery, db):
+    code = callback.data[14:]  # "adm_kunlockok_" is 14 chars
+    await callback.answer("Unlocked")
+    k = await _key_by_code(db, code)
+    if not k:
+        await callback.message.edit_text("❌ Not found.")
+        return
+    await db.keys.update_one({"_id": k["_id"]},
+        {"$set": {"status": "available", "unlocked_at": svc.now_utc()},
+         "$unset": {"order_id": "", "sold_at": "", "telegram_id": ""}})
+    await _log(db, callback.from_user.id, "unlock_key", {"id": str(k["_id"])})
+    pl = await _plan_by_code(db, _cbid(k["plan_id"]))
+    if not pl:
+        await callback.message.edit_text(
+            f"🔓 Key <code>{_esc(k['key_value'])}</code> unlocked — now available.",
+            parse_mode="HTML")
+        return
+    text, kb = await _plan_inventory(db, pl)
+    await callback.message.edit_text(
+        f"🔓 Unlocked <code>{_esc(k['key_value'])}</code>\n\n" + text,
+        parse_mode="HTML", reply_markup=kb)
+
+
+# ---- duplicate-key prompts (while in adding_keys state) ----
+
+@router.callback_query(F.data.startswith("adm_dupadd_"))
+async def cb_dup_add(callback: types.CallbackQuery, state: FSMContext, db):
+    code = callback.data[10:]
+    data = await state.get_data()
+    d = (data.get("dups") or {}).get(code)
+    if not d:
+        await callback.answer("Session expired — re-send the keys.", show_alert=True)
+        return
+    await db.keys.insert_one({
+        "product_id": ObjectId(d["pid"]), "plan_id": ObjectId(d["plan_id"]),
+        "key_value": d["kv"], "status": "available",
+        "created_at": svc.now_utc(), "duplicate_override": True})
+    dups = dict(data.get("dups") or {})
+    dups.pop(code, None)
+    await state.update_data(dups=dups)
+    await _log(db, callback.from_user.id, "add_key_duplicate",
+               {"key": d["kv"][:40]})
+    await callback.answer("✅ Added")
+    await callback.message.edit_text(
+        f"✅ Duplicate added anyway:\n<code>{_esc(d['kv'])}</code>",
+        parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("adm_dupskip_"))
+async def cb_dup_skip(callback: types.CallbackQuery, state: FSMContext):
+    code = callback.data[11:]
+    data = await state.get_data()
+    d = (data.get("dups") or {}).get(code)
+    if not d:
+        await callback.answer("Already handled.", show_alert=True)
+        return
+    dups = dict(data.get("dups") or {})
+    dups.pop(code, None)
+    await state.update_data(dups=dups)
+    await callback.answer("Skipped")
+    await callback.message.edit_text(
+        f"⏭ Skipped duplicate:\n<code>{_esc(d['kv'])}</code>",
+        parse_mode="HTML")
 
 
 # ================= Payments =================
@@ -1056,33 +1238,21 @@ async def _announce_delivery(bot, db, order, result, delivered=True):
         try:
             await bot.edit_message_text(
                 text, chat_id=pay["notify_chat_id"],
-                message_id=pay["notify_message_id"], parse_mode="HTML")
+                message_id=pay["notify_message_id"], parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
             if (pay.get("provider") or "manual") == "automatic":
                 pass  # fall through to also send fresh below
             else:
                 return
         except Exception:
             pass
-    # Fresh message path - group first, admin DMs as guaranteed fallback
-    targets = []
+    # Fresh message path - STRICTLY the verification group
     if Config.PAYMENT_VERIFICATION_GROUP_ID:
-        targets.append(Config.PAYMENT_VERIFICATION_GROUP_ID)
-    if (pay or {}).get("provider") == "automatic" or not targets:
-        targets.extend(Config.ADMIN_IDS)
-    sent = False
-    for tid in dict.fromkeys(targets):
         try:
-            await bot.send_message(tid, text, parse_mode="HTML")
-            sent = True
+            await bot.send_message(Config.PAYMENT_VERIFICATION_GROUP_ID,
+                                   text, parse_mode="HTML")
         except Exception:
             pass
-    if not sent:
-        for aid in Config.ADMIN_IDS:
-            try:
-                await bot.send_message(aid, text, parse_mode="HTML")
-                break
-            except Exception:
-                pass
 
 
 @router.callback_query(F.data.regexp(r"^ver_(?!ok_|no_|cust_)"))
@@ -1130,11 +1300,13 @@ async def cb_verify_ok(callback: types.CallbackQuery, db):
     await callback.answer("Approving...")
     order = await db.orders.find_one({"order_id": order_id})
     if not order or order.get("status") != "pending":
-        await _edit_alert(callback, "⚠️ Order not pending — already processed.")
+        await _edit_alert(callback, "⚠️ Order not pending — already processed.",
+                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
         return
     result = await svc.approve_payment(db, order, callback.from_user.id)
     if result is None:
-        await _edit_alert(callback, "⚠️ Already processed.")
+        await _edit_alert(callback, "⚠️ Already processed.",
+                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
         return
     if result.get("error") == "out_of_stock":
         await _edit_alert(callback,
@@ -1151,14 +1323,12 @@ async def cb_verify_ok(callback: types.CallbackQuery, db):
     if delivered:
         await _edit_alert(callback,
             f"✅ Payment approved & delivered.\nOrder: <code>{order_id}</code>",
-            reply_markup=KB.back_nav("adm_payments", "🔙 Payments"))
-        await _notify_customer_text(callback.bot, order["telegram_id"],
-            f"🎉 Payment verified! Your key + files are on the way. 🆔 {order_id}")
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
     else:
         await _edit_alert(callback,
             f"⚠️ Approved but delivery FAILED (user unreachable).\n"
             f"Key returned to stock — order stays paid.\nOrder: <code>{order_id}</code>",
-            reply_markup=KB.back_nav("adm_payments", "🔙 Payments"))
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
         await _notify_customer_text(callback.bot, order["telegram_id"],
             f"⚠️ Your order {order_id} is approved but we couldn't reach you. "
             f"Please /start the bot so we can deliver your key.")
@@ -1170,12 +1340,13 @@ async def cb_verify_no(callback: types.CallbackQuery, db):
     await callback.answer("Rejecting...")
     order = await db.orders.find_one({"order_id": order_id})
     if not order or order.get("status") != "pending":
-        await _edit_alert(callback, "⚠️ Already processed.")
+        await _edit_alert(callback, "⚠️ Already processed.",
+                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
         return
     await svc.reject_payment(db, order, callback.from_user.id)
     await _log(db, callback.from_user.id, "reject_payment", {"order": order_id})
     await _edit_alert(callback, f"❌ Order <code>{order_id}</code> rejected.",
-                      reply_markup=KB.back_nav("adm_payments", "🔙 Payments"))
+                      reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
     await _notify_customer_text(callback.bot, order["telegram_id"],
         f"❌ Payment for order {order_id} was rejected. Contact support if this is a mistake.")
 
@@ -1357,8 +1528,14 @@ async def cb_cust_block(callback: types.CallbackQuery, db):
 async def cb_files_main(callback: types.CallbackQuery, db):
     await callback.answer()
     products = await db.products.find({"status": "active"}).sort("display_order", 1).to_list(50)
-    rows = [[InlineKeyboardButton(text=f"🎮 {p['name']}", callback_data=f"adm_pfiles_{p['_id']}")]
-            for p in products]
+    rows = []
+    for p in products:
+        files = p.get("files", {}) or {}
+        apk_ok = bool(files.get("apk", {}).get("file_id") or p.get("apk_file_id"))
+        vid_ok = bool(files.get("video", {}).get("file_id") or p.get("setup_video_file_id"))
+        mark = "✅" if (apk_ok and vid_ok) else ("🟡" if (apk_ok or vid_ok) else "❌")
+        rows.append([InlineKeyboardButton(
+            text=f"🎮 {p['name']} {mark}", callback_data=f"adm_pfiles_{p['_id']}")])
     # global tutorial
     tut = await db.tutorial.find_one({"_id": "howto"})
     rows.append([InlineKeyboardButton(
@@ -1402,16 +1579,16 @@ async def cb_pfiles(callback: types.CallbackQuery, db):
         return
     files = p.get("files", {})
     status = {k: ("✅" if files.get(k, {}).get("file_id") else "❌")
-              for k in ("apk", "video", "document")}
+              for k in ("apk", "video")}
     await callback.message.edit_text(
         f"📁 <b>FILES — {_esc(p['name'])}</b>\n\n"
-        f"📱 APK: {status['apk']} | 🎬 Video: {status['video']} | 📄 Doc: {status['document']}",
+        f"📱 APK: {status['apk']} | 🎬 Video: {status['video']}",
         parse_mode="HTML",
         reply_markup=_kb([
             [InlineKeyboardButton(text="📱 Upload APK", callback_data=f"adm_fu_apk_{pid}"),
              InlineKeyboardButton(text="🎬 Upload Video", callback_data=f"adm_fu_vid_{pid}")],
-            [InlineKeyboardButton(text="📄 Upload Doc", callback_data=f"adm_fu_doc_{pid}"),
-             InlineKeyboardButton(text="📝 Instructions", callback_data=f"adm_fi_{pid}")],
+            [InlineKeyboardButton(text="📝 Instructions", callback_data=f"adm_fi_{pid}"),
+             InlineKeyboardButton(text="🗑 Clear Files", callback_data=f"adm_fc_{pid}")],
             [InlineKeyboardButton(text="🗑 Clear Files", callback_data=f"adm_fc_{pid}"),
              InlineKeyboardButton(text="🔗 Links", callback_data=f"adm_plinks_{pid}")],
             [InlineKeyboardButton(text="🔙 Product", callback_data=f"adm_prod_{pid}")],
@@ -1421,10 +1598,9 @@ async def cb_pfiles(callback: types.CallbackQuery, db):
 class _FileStates(StatesGroup):
     apk = State()
     vid = State()
-    doc = State()
 
 
-FILE_STATE_MAP = {"fu_apk": _FileStates.apk, "fu_vid": _FileStates.vid, "fu_doc": _FileStates.doc}
+FILE_STATE_MAP = {"fu_apk": _FileStates.apk, "fu_vid": _FileStates.vid}
 
 
 @router.callback_query(F.data.startswith("adm_fu_"))
@@ -1438,8 +1614,8 @@ async def cb_file_upload(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(st)
     await state.update_data(pid=pid,
-        kind={"apk": "apk", "vid": "video", "doc": "document"}[kind])
-    labels = {"apk": "APK file (send as document/file)", "vid": "setup video", "doc": "document"}
+        kind={"apk": "apk", "vid": "video"}[kind])
+    labels = {"apk": "APK file (send as document/file)", "vid": "setup video"}
     await callback.message.edit_text(f"📤 Send the {labels[kind]}:")
 
 
@@ -1463,11 +1639,6 @@ async def st_fu_apk(m, state, db):
 @router.message(_FileStates.vid, F.video)
 async def st_fu_vid(m, state, db):
     await _save_file(m, state, db, m.video.file_id, "setup.mp4")
-
-
-@router.message(_FileStates.doc, F.document)
-async def st_fu_doc(m, state, db):
-    await _save_file(m, state, db, m.document.file_id, m.document.file_name)
 
 
 @router.callback_query(F.data.startswith("adm_fc_"))
@@ -1552,6 +1723,108 @@ async def cb_link_del(callback: types.CallbackQuery, db):
     await cb_plinks(callback, db)
 
 
+# ================= Promo Broadcast =================
+
+@router.callback_query(F.data == "adm_promo")
+async def cb_promo(callback: types.CallbackQuery, db):
+    await callback.answer()
+    products = await db.products.find({"status": "active"}).sort("display_order", 1).to_list(100)
+    if not products:
+        await callback.message.edit_text("❌ No active products.",
+            reply_markup=KB.back_nav("adm_dash", "🔙 Dashboard"))
+        return
+    rows = [[InlineKeyboardButton(text=f"🎮 {p['name']}",
+            callback_data=f"promo_{_cbid(p['_id'])}")] for p in products]  # hashed - 64B limit
+    rows.append([InlineKeyboardButton(text="🔙 Dashboard", callback_data="adm_dash")])
+    await callback.message.edit_text(
+        "🎯 <b>PROMO BROADCAST</b>\n\nPick a product to promote:",
+        parse_mode="HTML", reply_markup=_kb(rows))
+
+
+@router.callback_query(F.data.regexp(r"^promo_(?!go_)"))
+async def cb_promo_product(callback: types.CallbackQuery, db):
+    code = callback.data[6:]  # hashed product id - 64B limit
+    await callback.answer()
+    p = await svc.product_by_code(db, code)
+    if not p:
+        await callback.message.edit_text("❌ Product not found.")
+        return
+    pid = str(p["_id"])
+    plans = await _plans_of(db, pid)
+    rows = [[InlineKeyboardButton(text="📦 Whole Product (all plans)",
+            callback_data=f"promo_go_{_cbid(pid)}_all")]]
+    for pl in plans:
+        rows.append([InlineKeyboardButton(
+            text=f"⏱️ {pl['name']} — ₹{pl['price']:g}",
+            callback_data=f"promo_go_{_cbid(pid)}_{svc.cbid(pl['_id'])}")])  # hashed - 64B
+    rows.append([InlineKeyboardButton(text="🔙 Products", callback_data="adm_promo")])
+    await callback.message.edit_text(
+        f"🎯 Promote <b>{_esc(p['name'])}</b> — pick target:",
+        parse_mode="HTML", reply_markup=_kb(rows))
+
+
+@router.callback_query(F.data.startswith("promo_go_"))
+async def cb_promo_go(callback: types.CallbackQuery, state: FSMContext, db):
+    rest = callback.data[len("promo_go_"):]
+    pcode, code = rest.rsplit("_", 1)  # hashed product id + plan code/all
+    await callback.answer()
+    p = await svc.product_by_code(db, pcode)
+    if not p:
+        await callback.message.edit_text("❌ Product not found.")
+        return
+    pid = str(p["_id"])
+    plan = None
+    if code != "all":
+        plan = await svc.plan_by_code(db, code)
+        if not plan:
+            await callback.message.edit_text("❌ Plan not found.")
+            return
+    await state.update_data(promo_pid=pid, promo_plan=str(plan["_id"]) if plan else None)
+    await state.set_state(AdminStates.promo_text)
+    await callback.message.edit_text(
+        "✏️ <b>PROMO MESSAGE</b>\n\n"
+        "Send the broadcast text, or 'default' for an auto promo:\n\n"
+        "<i>Default looks like:</i>\n"
+        "🎉 NEW DROP! 🎮 product ⏱️ plan 💰 price — tap button below",
+        parse_mode="HTML")
+
+
+@router.message(AdminStates.promo_text, F.text)
+async def st_promo_text(m, state, db):
+    data = await state.get_data()
+    pid = data["promo_pid"]
+    p = await db.products.find_one({"_id": ObjectId(pid)})
+    if not p:
+        await state.clear()
+        await m.answer("❌ Product gone.", reply_markup=KB.reply_menu())
+        return
+    plan = None
+    if data.get("promo_plan"):
+        plan = await db.plans.find_one({"_id": ObjectId(data["promo_plan"])})
+
+    text = m.text.strip()
+    if text.lower() == "default":
+        price = plan.get("price") if plan else None
+        price_txt = f"💰 ₹{price:g}" if price else "💰 Check plans inside"
+        plan_line = f"⏱️ {_esc(plan['name'])}\n" if plan else ""
+        text = (
+            "🎉 <b>NEW DROP!</b> ⚡\n\n"
+            f"🎮 <b>{_esc(p['name'])}</b>\n"
+            f"{plan_line}{price_txt}\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Tap the button below to grab yours! 🔥"
+        )
+    # button deep-links straight into purchase flow
+    if plan:
+        cb = {"label": f"🛒 {_esc(p['name'])} — {_esc(plan['name'])}"[:64],
+              "data": f"plan_{svc.cbid(plan['_id'])}"}
+    else:
+        cb = {"label": f"🛒 {_esc(p['name'])}"[:64],
+              "data": f"prod_{svc.cbid(p['_id'])}"}  # hashed - 64B limit
+    await state.clear()
+    await _do_broadcast(m, state, db, "text", text, None, cb=cb)
+
+
 # ================= Broadcast =================
 
 @router.callback_query(F.data == "adm_broadcast")
@@ -1613,13 +1886,16 @@ async def st_bc_link(m, state, db):
                         data["bc_payload"], data["bc_caption"], link)
 
 
-async def _do_broadcast(m, state, db, kind, payload, caption, link=None):
+async def _do_broadcast(m, state, db, kind, payload, caption, link=None, cb=None):
     users = await db.users.find({"is_blocked": {"$ne": True}}, {"telegram_id": 1}).to_list(10000)
     status = await m.answer(f"📢 Broadcasting to {len(users)} users...")
     kb = None
     if link:
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=link["label"], url=link["url"])]])
+    elif cb:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=cb["label"], callback_data=cb["data"])]])
     sent = failed = 0
     for u in users:
         try:
@@ -1641,7 +1917,8 @@ async def _do_broadcast(m, state, db, kind, payload, caption, link=None):
         if (sent + failed) % 30 == 0:
             await asyncio.sleep(1)
     await _log(db, m.from_user.id, "broadcast",
-               {"sent": sent, "failed": failed, "kind": kind, "link": bool(link)})
+               {"sent": sent, "failed": failed, "kind": kind,
+                "link": bool(link), "cb": bool(cb)})
     await state.clear()
     try:
         await status.edit_text(f"✅ Broadcast done: {sent} sent, {failed} failed.")
@@ -1664,11 +1941,16 @@ SETTING_LABELS = {
 }
 
 
+async def _settings_kb(db):
+    s = await svc.get_settings(db)
+    return KB.settings_menu(bool(s.get("maintenance_mode")))
+
+
 @router.callback_query(F.data == "adm_settings")
-async def cb_settings(callback: types.CallbackQuery):
+async def cb_settings(callback: types.CallbackQuery, db):
     await callback.answer()
     await callback.message.edit_text("⚙️ <b>BOT SETTINGS</b>", parse_mode="HTML",
-                                  reply_markup=KB.settings_menu())
+                                  reply_markup=await _settings_kb(db))
 
 
 @router.callback_query(F.data.startswith("set_"))
@@ -1691,6 +1973,7 @@ async def st_edit_setting(m, state, db):
     await db.settings.update_one({"key": data["key"]},
         {"$set": {"key": data["key"], "value": m.text.strip(), "updated_at": svc.now_utc()}},
         upsert=True)
+    svc.invalidate_settings()
     await _log(db, m.from_user.id, "edit_setting", {"key": data["key"]})
     await state.clear()
     await m.answer("✅ Setting saved.", reply_markup=KB.back_nav("adm_settings", "🔙 Settings"))
@@ -1711,26 +1994,7 @@ async def cb_paymode(callback: types.CallbackQuery, db):
         parse_mode="HTML", reply_markup=KB.back_nav("adm_settings", "🔙 Settings"))
 
 
-@router.callback_query(F.data == "adm_notifytarget")
-async def cb_notifytarget(callback: types.CallbackQuery, db):
-    """Cycle payment-alert destination: group -> admins -> both -> group"""
-    await callback.answer()
-    s = await svc.get_settings(db)
-    cur = s.get("payment_notify_target", "group")
-    order = ["group", "admins", "both"]
-    new = order[(order.index(cur) + 1) % len(order)] if cur in order else "group"
-    await db.settings.update_one({"key": "payment_notify_target"},
-        {"$set": {"key": "payment_notify_target", "value": new,
-                  "updated_at": svc.now_utc()}}, upsert=True)
-    await _log(db, callback.from_user.id, "notify_target", {"target": new})
-    labels = {
-        "group": "👥 Verification Group only",
-        "admins": "🛡️ Admin DMs only",
-        "both": "👥 Group + 🛡️ Admin DMs",
-    }
-    await callback.message.edit_text(
-        f"📣 Payment alerts → <b>{labels[new]}</b>",
-        parse_mode="HTML", reply_markup=KB.back_nav("adm_settings", "🔙 Settings"))
+# (payment_notify_target toggle removed - alerts go strictly to the group)
 
 
 @router.callback_query(F.data == "adm_maintoggle")
@@ -1741,9 +2005,9 @@ async def cb_maintoggle(callback: types.CallbackQuery, db):
     await db.settings.update_one({"key": "maintenance_mode"},
         {"$set": {"key": "maintenance_mode", "value": new, "updated_at": svc.now_utc()}}, upsert=True)
     await _log(db, callback.from_user.id, "maintenance", {"on": new})
-    await callback.message.edit_text(
-        f"🔧 Maintenance {'🔴 ENABLED' if new else '🟢 DISABLED'}",
-        reply_markup=KB.back_nav("adm_settings", "🔙 Settings"))
+    svc.invalidate_settings()
+    await callback.message.edit_text("⚙️ <b>BOT SETTINGS</b>", parse_mode="HTML",
+                                     reply_markup=await _settings_kb(db))
 
 
 # ================= Admins =================

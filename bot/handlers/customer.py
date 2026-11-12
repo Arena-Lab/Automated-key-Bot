@@ -243,14 +243,21 @@ async def cb_product(callback: types.CallbackQuery, db):
     await callback.answer()
     product = await db.products.find_one({"_id": ObjectId(pid), "status": "active"})
     if not product:
+        # promo broadcast buttons carry a hashed product id
+        product = await svc.product_by_code(db, pid)
+    if not product or product.get("status") != "active":
         await callback.message.answer("❌ Product unavailable.", reply_markup=KB.reply_menu())
         return
     plans = await svc.enrich_plans(db, product["_id"])
-    desc = product.get("description") or ""
-    plat = product.get("platform")
-    plat_line = f"📱 Platform: {plat}\n\n" if plat else ""
-    text = (f"🎮 <b>{_esc(product['name'])}</b>\n\n"
-            f"{plat_line}{_esc(desc)}\n\n⏱️ <b>Choose validity:</b>")
+    desc = (product.get("description") or "").strip()
+    plat = (product.get("platform") or "").strip()
+    title = f"🎮 <b>{_esc(product['name'])}</b>"
+    if plat:
+        title += f" <i>({_esc(plat)})</i>"
+    text = title
+    if desc:
+        text += f"\n\n{_esc(desc)}"
+    text += "\n\n⏱️ <b>Select key duration:</b>"
     await callback.message.answer(text, parse_mode="HTML", reply_markup=KB.plans(plans, pid))
 
 
@@ -261,6 +268,9 @@ async def cb_plan(callback: types.CallbackQuery, user: dict, state: FSMContext, 
 
     plan = await db.plans.find_one({"_id": ObjectId(plan_id), "status": "active"})
     if not plan:
+        # promo broadcast buttons carry a hashed plan id
+        plan = await svc.plan_by_code(db, plan_id)
+    if not plan or plan.get("status", "active") != "active":
         await callback.message.answer("❌ Plan unavailable.")
         return
     product = await db.products.find_one({"_id": plan["product_id"], "status": "active"})
@@ -491,17 +501,9 @@ async def cb_pay_cancel(callback: types.CallbackQuery, user: dict, state: FSMCon
 
 
 async def _payment_destinations(db):
-    """Resolve (group_ids, admin_ids) for payment alerts.
-    Setting 'payment_notify_target': group (default) | admins | both.
-    Falls back to admin DMs if the group isn't configured."""
-    s = await svc.get_settings(db)
-    mode = s.get("payment_notify_target", "group")
+    """Payment alerts go STRICTLY to the verification group from .env."""
     group_id = Config.PAYMENT_VERIFICATION_GROUP_ID
-    group_ids = [group_id] if (mode in ("group", "both") and group_id) else []
-    admin_ids = list(Config.ADMIN_IDS) if (
-        mode in ("admins", "both") or (mode == "group" and not group_id)
-    ) else []
-    return group_ids, admin_ids
+    return ([group_id] if group_id else []), []
 
 
 async def _send_alert(bot, tid, text, reply_markup=None, screenshot_file_id=None):
@@ -525,25 +527,14 @@ async def _send_alert(bot, tid, text, reply_markup=None, screenshot_file_id=None
 
 
 async def _dispatch_alert(db, bot, text, reply_markup=None, screenshot_file_id=None):
-    """Send to configured targets; if NOTHING was delivered, fall back to
-    every possible destination (group + admin DMs) regardless of the toggle,
-    so payment alerts are never lost. Returns list of sent message refs."""
-    group_ids, admin_ids = await _payment_destinations(db)
+    """Send payment alert STRICTLY to the verification group.
+    Returns list of sent message refs (empty if group send failed)."""
+    group_ids, _ = await _payment_destinations(db)
     refs = []
-    for tid in group_ids + admin_ids:
+    for tid in group_ids:
         ref = await _send_alert(bot, tid, text, reply_markup, screenshot_file_id)
         if ref:
             refs.append(ref)
-    # Total failure -> try every reachable destination as fallback
-    if not refs:
-        fallback = []
-        if Config.PAYMENT_VERIFICATION_GROUP_ID:
-            fallback.append(Config.PAYMENT_VERIFICATION_GROUP_ID)
-        fallback.extend(Config.ADMIN_IDS)
-        for tid in dict.fromkeys(fallback):  # dedupe, preserve order
-            ref = await _send_alert(bot, tid, text, reply_markup, screenshot_file_id)
-            if ref:
-                refs.append(ref)
     return refs
 
 
@@ -684,7 +675,7 @@ async def cb_files(callback: types.CallbackQuery, user: dict, db):
         await callback.message.answer("❌ Product data missing.")
         return
     files = product.get("files", {})
-    for kind in ("apk", "video", "document"):
+    for kind in ("apk", "video"):
         f = files.get(kind)
         if not f or not f.get("file_id"):
             continue

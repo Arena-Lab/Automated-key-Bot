@@ -1,6 +1,7 @@
 """Core services: orders, payments, atomic inventory, delivery (bot/svc.py)"""
 
 import asyncio
+import hashlib
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,11 @@ def fmt_ist(dt: datetime) -> str:
 
 _settings_cache = {"ts": 0.0, "data": {}}
 _SETTINGS_TTL = 30.0  # seconds
+
+
+def invalidate_settings():
+    _settings_cache["data"] = {}
+    _settings_cache["ts"] = 0.0
 
 
 async def get_settings(db) -> Dict[str, Any]:
@@ -170,6 +176,13 @@ async def approve_payment(db, order: Dict, admin_telegram_id: int) -> Optional[D
     order["key_id"] = key["_id"]
     order["key_value"] = key["key_value"]
 
+    # manual revenue override grows with each approved order
+    s = await get_settings(db)
+    if s.get("revenue_manual") is not None:
+        await db.settings.update_one({"key": "revenue_manual"},
+            {"$inc": {"value": float(order.get("amount", 0))}})
+        invalidate_settings()
+
     product = await db.products.find_one({"_id": order["product_id"]})
     return {"key": key, "product": product, "order": order}
 
@@ -213,6 +226,25 @@ async def product_stock_total(db, product_id) -> int:
     })
 
 
+def cbid(oid) -> str:
+    """24-char hash safe for Telegram's 64-byte callback_data limit."""
+    return hashlib.md5(str(oid).encode("utf-8")).hexdigest()[:24]
+
+
+async def plan_by_code(db, code: str):
+    for p in await db.plans.find({}).to_list(500):
+        if cbid(p["_id"]) == code:
+            return p
+    return None
+
+
+async def product_by_code(db, code: str):
+    for p in await db.products.find({}).to_list(500):
+        if cbid(p["_id"]) == code:
+            return p
+    return None
+
+
 def _norm_id(v) -> str:
     if isinstance(v, dict):
         v = v.get("$oid") or v.get("_id") or ""
@@ -246,8 +278,6 @@ def _product_files(product: Dict) -> Dict[str, Dict]:
         files["apk"] = {"file_id": product["apk_file_id"], "name": product.get("apk_name")}
     if product.get("setup_video_file_id") and "video" not in files:
         files["video"] = {"file_id": product["setup_video_file_id"]}
-    if product.get("setup_doc_file_id") and "document" not in files:
-        files["document"] = {"file_id": product["setup_doc_file_id"]}
     return files
 
 
@@ -257,9 +287,8 @@ async def resend_product_files(bot, telegram_id: int, product: Dict):
     captions = {
         "apk": "📱 <b>Latest APK</b>\nDownload and install to activate your key.",
         "video": "🎬 <b>Setup Video</b>\nWatch this before activating.",
-        "document": "📄 <b>Setup Document</b>",
     }
-    for kind in ("apk", "video", "document"):
+    for kind in ("apk", "video"):
         f = files.get(kind)
         if not f or not f.get("file_id"):
             continue

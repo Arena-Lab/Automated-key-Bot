@@ -94,11 +94,10 @@ class KB:
              InlineKeyboardButton(text="🛍️ Products", callback_data="adm_products")],
             [InlineKeyboardButton(text="💳 Payments", callback_data="adm_payments"),
              InlineKeyboardButton(text="📦 Orders", callback_data="adm_orders")],
-            [InlineKeyboardButton(text="🔑 Keys", callback_data="adm_keys"),
-             InlineKeyboardButton(text="👥 Customers", callback_data="adm_customers")],
-            [InlineKeyboardButton(text="📁 Files", callback_data="adm_files"),
-             InlineKeyboardButton(text="📢 Broadcast", callback_data="adm_broadcast")],
-            [InlineKeyboardButton(text="⚙️ Settings", callback_data="adm_settings")],
+            [InlineKeyboardButton(text="👥 Customers", callback_data="adm_customers")],
+            [InlineKeyboardButton(text="📁 Files", callback_data="adm_files")],
+            [InlineKeyboardButton(text="📢 Broadcast", callback_data="adm_broadcast"),
+             InlineKeyboardButton(text="🎯 Promo", callback_data="adm_promo")],
             [InlineKeyboardButton(text="🔄 Restart", callback_data="adm_restart"),
              InlineKeyboardButton(text="🚪 Exit", callback_data="adm_exit")],
         ])
@@ -121,12 +120,12 @@ class KB:
     @staticmethod
     def product_detail(pid: str) -> InlineKeyboardMarkup:
         return _ikb([
-            [InlineKeyboardButton(text="📝 Edit Info", callback_data=f"adm_pe_{pid}")],
             [InlineKeyboardButton(text="⏱️ Plans", callback_data=f"adm_plans_{pid}"),
              InlineKeyboardButton(text="🔑 Keys", callback_data=f"adm_pkeys_{pid}")],
-            [InlineKeyboardButton(text="📁 Files", callback_data=f"adm_pfiles_{pid}"),
-             InlineKeyboardButton(text="🔗 Links", callback_data=f"adm_plinks_{pid}")],
-            [InlineKeyboardButton(text="👁 View", callback_data=f"adm_pview_{pid}"),
+            [InlineKeyboardButton(text="📁 Files & Links", callback_data=f"adm_pfiles_{pid}")],
+            [InlineKeyboardButton(text="👁 Preview", callback_data=f"adm_pview_{pid}"),
+             InlineKeyboardButton(text="📝 Edit", callback_data=f"adm_pe_{pid}")],
+            [InlineKeyboardButton(text="🟢/🔴 Toggle", callback_data=f"adm_f_toggle_{pid}"),
              InlineKeyboardButton(text="🗑 Delete", callback_data=f"adm_pdel_{pid}")],
             [InlineKeyboardButton(text="🔙 Products", callback_data="adm_products")],
         ])
@@ -136,11 +135,29 @@ class KB:
         return _ikb([
             [InlineKeyboardButton(text="✏️ Name", callback_data=f"adm_f_name_{pid}"),
              InlineKeyboardButton(text="📝 Description", callback_data=f"adm_f_desc_{pid}")],
-            [InlineKeyboardButton(text="🖼 Image", callback_data=f"adm_f_img_{pid}"),
-             InlineKeyboardButton(text="📊 Order", callback_data=f"adm_f_ord_{pid}")],
-            [InlineKeyboardButton(text="📱 Platform", callback_data=f"adm_f_plat_{pid}"),
-             InlineKeyboardButton(text="🟢/🔴 Toggle", callback_data=f"adm_f_toggle_{pid}")],
+            [InlineKeyboardButton(text="📊 Display Order", callback_data=f"adm_f_ord_{pid}"),
+             InlineKeyboardButton(text="📱 Platform", callback_data=f"adm_f_plat_{pid}")],
+            [InlineKeyboardButton(text="🟢/🔴 Show-Hide", callback_data=f"adm_f_toggle_{pid}")],
             [InlineKeyboardButton(text="🔙 Product", callback_data=f"adm_prod_{pid}")],
+        ])
+
+    @staticmethod
+    def keys_view(plan_id: str, keys: list) -> InlineKeyboardMarkup:
+        rows = []
+        for k in keys[:30]:
+            icon = "🟢" if k.get("status") == "available" else "⚫"
+            label = str(k.get("key_value", ""))[:30]
+            rows.append([InlineKeyboardButton(
+                text=f"{icon} {label}", callback_data=f"adm_kd_{k['_id']}")])
+        rows.append([InlineKeyboardButton(text="➕ Add Keys", callback_data=f"adm_kadd_{plan_id}")])
+        rows.append([InlineKeyboardButton(text="🔙 Product Keys", callback_data="adm_keys_menu")])
+        return _ikb(rows)
+
+    @staticmethod
+    def confirm_delete(text: str, yes_cb: str, no_cb: str = "adm_prod_{pid}") -> InlineKeyboardMarkup:
+        return _ikb([
+            [InlineKeyboardButton(text="✅ Yes, Delete", callback_data=yes_cb),
+             InlineKeyboardButton(text="❌ Cancel", callback_data=no_cb)],
         ])
 
     @staticmethod
@@ -163,7 +180,8 @@ class KB:
         ])
 
     @staticmethod
-    def settings_menu() -> InlineKeyboardMarkup:
+    def settings_menu(maint_on: bool = False) -> InlineKeyboardMarkup:
+        maint_label = "🔴 Maintenance: ON" if maint_on else "🟢 Maintenance: OFF"
         return _ikb([
             [InlineKeyboardButton(text="🏪 Shop Name", callback_data="set_name"),
              InlineKeyboardButton(text="👋 Welcome Msg", callback_data="set_welcome")],
@@ -174,9 +192,8 @@ class KB:
             [InlineKeyboardButton(text="📋 Instructions", callback_data="set_instructions"),
              InlineKeyboardButton(text="🔧 Maintenance Msg", callback_data="set_maint")],
             [InlineKeyboardButton(text="🔴 How to Buy Text", callback_data="set_howto")],
-            [InlineKeyboardButton(text="💳 Payment Mode", callback_data="adm_paymode"),
-             InlineKeyboardButton(text="📣 Payment Alerts", callback_data="adm_notifytarget")],
-            [InlineKeyboardButton(text="🔧 Maintenance ON/OFF", callback_data="adm_maintoggle")],
+            [InlineKeyboardButton(text="💳 Payment Mode", callback_data="adm_paymode")],
+            [InlineKeyboardButton(text=maint_label, callback_data="adm_maintoggle")],
             [InlineKeyboardButton(text="🔙 Dashboard", callback_data="adm_dash")],
         ])
 
