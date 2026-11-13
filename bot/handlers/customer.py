@@ -412,27 +412,33 @@ async def cb_plan(callback: types.CallbackQuery, user: dict, state: FSMContext, 
     # QR code: single send attempt - generated per-order UPI QR. On ANY
     # failure send text-only payment info; never chain photo fallbacks
     # (a timed-out send may still deliver -> duplicate messages/orders).
+    _t0 = svc.now_utc()
     try:
         qr_bytes = await asyncio.to_thread(_qr_png, upi_uri)
     except Exception as e:
         logger.warning("QR generation failed: %s", e)
         qr_bytes = None
+    logger.info("Order %s QR gen: %dms (%s)", order["order_id"],
+                int((svc.now_utc() - _t0).total_seconds() * 1000),
+                "ok" if qr_bytes else "FAILED")
+    # ONE attempt only - no fallback chain. If the photo send fails/times
+    # out, Telegram may still have delivered it; sending anything else
+    # would duplicate the payment message. Order persists - retrying the
+    # plan button reuses this same order with a fresh QR.
     try:
         if qr_bytes:
-            sent = await callback.message.answer_photo(
-                BufferedInputFile(qr_bytes, filename="qr.png"),
-                caption=caption, parse_mode="HTML", reply_markup=pay_kb,
-            )
+            sent = await asyncio.wait_for(
+                callback.message.answer_photo(
+                    BufferedInputFile(qr_bytes, filename="qr.png"),
+                    caption=caption, parse_mode="HTML", reply_markup=pay_kb,
+                ), timeout=25)
         else:
             sent = await callback.message.answer(
                 caption, parse_mode="HTML", reply_markup=pay_kb)
     except Exception as e:
-        logger.warning("Payment message send failed: %s", e)
-        try:
-            sent = await callback.message.answer(
-                caption, parse_mode="HTML", reply_markup=pay_kb)
-        except Exception:
-            sent = None
+        logger.warning("Payment message send failed for %s: %r",
+                       order["order_id"], e)
+        return
     if sent is None:
         return
 
