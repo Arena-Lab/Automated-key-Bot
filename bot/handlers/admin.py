@@ -75,6 +75,126 @@ async def cmd_settings(message: types.Message, db):
                          reply_markup=await _settings_kb(db))
 
 
+# ================= User block commands (admin only via admin_guard) =================
+
+def _parse_tid(arg: str):
+    arg = (arg or "").strip().lstrip("@")
+    try:
+        return int(arg)
+    except ValueError:
+        return None
+
+
+async def _user_card(db, tid: int):
+    return await db.users.find_one({"telegram_id": tid})
+
+
+@router.message(F.text.regexp(r"^/blockuser(\s+\S+)?$"))
+async def cmd_block_user(message: types.Message, db):
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "🚫 <b>Block a user</b>\n\nUsage: <code>/blockuser USER_ID</code>\n\n"
+            "The bot will stop responding to them entirely.",
+            parse_mode="HTML")
+        return
+    tid = _parse_tid(parts[1])
+    if not tid:
+        await message.answer("❌ Invalid user ID. Send the numeric Telegram ID.")
+        return
+    if tid in {int(a) for a in Config.ADMIN_IDS}:
+        await message.answer("⛔ Cannot block an admin.")
+        return
+    u = await _user_card(db, tid)
+    await db.users.update_one(
+        {"telegram_id": tid},
+        {"$set": {"is_blocked": True, "updated_at": svc.now_utc()},
+         "$setOnInsert": {"telegram_id": tid, "created_at": svc.now_utc()}},
+        upsert=True)
+    await _log(db, message.from_user.id, "block_user", {"tid": tid})
+    name = _esc((u or {}).get("first_name") or (u or {}).get("username") or "-")
+    await message.answer(
+        f"🚫 <b>User blocked</b>\n\n"
+        f"🆔 <code>{tid}</code>\n👤 {name}\n\n"
+        "They will get no responses from the bot.\n"
+        f"Undo: <code>/unblockuser {tid}</code>",
+        parse_mode="HTML")
+
+
+@router.message(F.text.regexp(r"^/unblockuser(\s+\S+)?$"))
+async def cmd_unblock_user(message: types.Message, db):
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "✅ <b>Unblock a user</b>\n\nUsage: <code>/unblockuser USER_ID</code>",
+            parse_mode="HTML")
+        return
+    tid = _parse_tid(parts[1])
+    if not tid:
+        await message.answer("❌ Invalid user ID.")
+        return
+    u = await _user_card(db, tid)
+    if not u:
+        await message.answer(f"ℹ️ User <code>{tid}</code> not found in database.",
+                             parse_mode="HTML")
+        return
+    await db.users.update_one({"telegram_id": tid},
+        {"$set": {"is_blocked": False, "updated_at": svc.now_utc()}})
+    await _log(db, message.from_user.id, "unblock_user", {"tid": tid})
+    await message.answer(
+        f"✅ <b>User unblocked</b>\n\n🆔 <code>{tid}</code>\n\n"
+        "They can use the bot again.",
+        parse_mode="HTML")
+
+
+@router.message(F.text.regexp(r"^/blockedusers$"))
+async def cmd_blocked_users(message: types.Message, db):
+    users = await db.users.find({"is_blocked": True}).to_list(200)
+    if not users:
+        await message.answer("✅ <b>Blocked users</b>\n\nNo users are blocked.",
+                             parse_mode="HTML")
+        return
+    lines = ["🚫 <b>BLOCKED USERS</b>",
+             f"<i>{len(users)} user(s)</i>\n"]
+    for u in users[:50]:
+        tid = u.get("telegram_id")
+        name = _esc(u.get("first_name") or u.get("username") or "-")
+        uname = f" (@{_esc(u['username'])})" if u.get("username") else ""
+        lines.append(f"• <code>{tid}</code> — {name}{uname}")
+    lines.append("\n<i>Unblock: <code>/unblockuser USER_ID</code></i>")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(F.text == "/adminhelp")
+async def cmd_admin_help(message: types.Message):
+    await message.answer(
+        "📖 <b>ADMIN COMMANDS & USAGE</b>\n\n"
+        "<b>Commands</b>\n"
+        "• <code>/admin</code> — opens the main control panel (dashboard with all sections)\n"
+        "• <code>/settings</code> — quick settings menu (shop name, messages, payment mode, maintenance)\n"
+        "• <code>/adminhelp</code> — this help page\n\n"
+        "<b>User moderation</b>\n"
+        "• <code>/blockuser USER_ID</code> — block a user; the bot stops responding to them completely "
+        "(messages + buttons). Works even if they never used the bot.\n"
+        "• <code>/unblockuser USER_ID</code> — restore a blocked user's access.\n"
+        "• <code>/blockedusers</code> — list all currently blocked users with their IDs.\n\n"
+        "<b>Panel sections (inside /admin)</b>\n"
+        "• 💳 <b>Payments</b> — approve/reject UPI payments; approving delivers key + APK + video automatically\n"
+        "• 🛍️ <b>Products</b> — add/edit/hide/delete products, manage plans & prices, manage keys\n"
+        "• 📁 <b>Files & Links</b> — upload APK + setup video per product, how-to-buy video, product links\n"
+        "• 👥 <b>Users</b> — view customers, search orders, block/unblock from customer profile\n"
+        "📊 <b>Stats</b> — sales, revenue, pending payments overview\n"
+        "📣 <b>Broadcast</b> — send text/photo/video/document to all non-blocked users\n"
+        "🎯 <b>Promo</b> — broadcast with product/plan buy buttons attached\n"
+        "🤝 <b>Resellers</b> — approve/reject reseller applications\n"
+        "🔄 <b>Restart</b> — restart the bot process\n\n"
+        "<b>Notes</b>\n"
+        "• USER_ID = numeric Telegram ID (find it in 👥 Users)\n"
+        "• Blocked users get <b>zero</b> responses and are excluded from broadcasts\n"
+        "• All panel actions are logged in admin logs",
+        parse_mode="HTML")
+
+
 @router.callback_query(F.data == "adm_dash")
 async def cb_dash(callback: types.CallbackQuery, db):
     await callback.answer()
@@ -1943,7 +2063,8 @@ SETTING_LABELS = {
 
 async def _settings_kb(db):
     s = await svc.get_settings(db)
-    return KB.settings_menu(bool(s.get("maintenance_mode")))
+    return KB.settings_menu(bool(s.get("maintenance_mode")),
+                            s.get("payment_mode", "manual"))
 
 
 @router.callback_query(F.data == "adm_settings")
@@ -1980,18 +2101,50 @@ async def st_edit_setting(m, state, db):
 
 
 @router.callback_query(F.data == "adm_paymode")
-async def cb_paymode(callback: types.CallbackQuery, db):
-    await callback.answer()
+async def cb_paymode_legacy(callback: types.CallbackQuery, db):
+    # old single-button keyboards (pre-restart) still carry this callback
     s = await svc.get_settings(db)
-    cur = s.get("payment_mode", "manual")
-    new = "automatic" if cur == "manual" else "manual"
+    new = "automatic" if s.get("payment_mode", "manual") == "manual" else "manual"
     await db.settings.update_one({"key": "payment_mode"},
         {"$set": {"key": "payment_mode", "value": new, "updated_at": svc.now_utc()}}, upsert=True)
+    svc.invalidate_settings()
     await _log(db, callback.from_user.id, "payment_mode", {"mode": new})
+    await callback.answer(f"Payment mode → {new}")
     await callback.message.edit_text(
-        f"💳 Payment mode → <b>{new.upper()}</b>\n\n"
-        "⚠️ 'automatic' requires a configured provider — manual UPI is the safe default.",
-        parse_mode="HTML", reply_markup=KB.back_nav("adm_settings", "🔙 Settings"))
+        "⚙️ <b>BOT SETTINGS</b>", parse_mode="HTML",
+        reply_markup=await _settings_kb(db))
+
+
+@router.callback_query(F.data.startswith("adm_paymode_"))
+async def cb_paymode(callback: types.CallbackQuery, db):
+    new = callback.data.rsplit("_", 1)[-1]
+    if new == "auto":
+        new = "automatic"
+    if new not in ("manual", "automatic"):
+        await callback.answer("Unknown", show_alert=True)
+        return
+    s = await svc.get_settings(db)
+    cur = s.get("payment_mode", "manual")
+    if cur == new:
+        await callback.answer(f"Already {new}")
+        return
+    await db.settings.update_one({"key": "payment_mode"},
+        {"$set": {"key": "payment_mode", "value": new, "updated_at": svc.now_utc()}}, upsert=True)
+    svc.invalidate_settings()
+    await _log(db, callback.from_user.id, "payment_mode", {"mode": new})
+    warn = ""
+    if new == "automatic":
+        from bot import payverify
+        if not payverify.PayVerifyConfig.from_env().configured:
+            warn = ("\n\n⚠️ Gmail IMAP not configured — add IMAP_USERNAME, "
+                    "IMAP_APP_PASSWORD and DEFAULT_UPI_ID to .env")
+    await callback.answer(
+        "Auto-verify ON — Gmail IMAP not configured" if warn
+        else f"Payment mode → {new}",
+        show_alert=bool(warn))
+    await callback.message.edit_text(
+        "⚙️ <b>BOT SETTINGS</b>" + warn,
+        parse_mode="HTML", reply_markup=await _settings_kb(db))
 
 
 # (payment_notify_target toggle removed - alerts go strictly to the group)

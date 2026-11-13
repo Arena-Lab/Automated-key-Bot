@@ -1,6 +1,7 @@
 """Key Shop Bot - entry point"""
 
 import asyncio
+import html
 import logging
 
 from aiogram import Bot, Dispatcher
@@ -76,6 +77,189 @@ async def payment_expiry_job(bot: Bot):
             await asyncio.sleep(30)
 
 
+async def _verify_group_notice(bot: Bot, text: str):
+    """Audit note to the payment-verification group (never raises)."""
+    if not Config.PAYMENT_VERIFICATION_GROUP_ID:
+        return
+    try:
+        await bot.send_message(Config.PAYMENT_VERIFICATION_GROUP_ID,
+                               text, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+async def _payverify_cycle(bot: Bot, db, cfg):
+    """One poll cycle: expire stale verifies, scan Gmail once, approve matches."""
+    from bot import payverify
+    now = svc.now_utc()
+
+    # verify window passed -> mark expired (order stays pending for manual UTR)
+    stale = await db.orders.find(
+        {"verify_status": "pending", "verify_expires_at": {"$lt": now}}
+    ).to_list(50)
+    for o in stale:
+        await db.orders.update_one(
+            {"_id": o["_id"], "verify_status": "pending"},
+            {"$set": {"verify_status": "expired", "updated_at": now}})
+
+    orders = await db.orders.find({
+        "status": "pending",
+        "verify_status": "pending",
+        "verify_expires_at": {"$gt": now},
+        "verify_purpose": {"$exists": True},
+    }).sort("created_at", 1).to_list(10)
+    if not orders:
+        return
+
+    candidates = [
+        (str(o["_id"]),
+         o.get("verify_created_at") or o.get("created_at"),
+         o["verify_purpose"], o.get("amount"))
+        for o in orders
+    ]
+    try:
+        matches = await payverify.find_matching_payments(cfg, candidates)
+    except payverify.GmailError as e:
+        logger.warning("PayVerify IMAP error: %s", e)
+        return
+    except Exception as e:
+        logger.error("PayVerify scan failed: %s", e)
+        return
+    if not matches:
+        return
+
+    admin_id = Config.ADMIN_IDS[0] if Config.ADMIN_IDS else 0
+    for o in orders:
+        msg = matches.get(str(o["_id"]))
+        if not msg:
+            continue
+        # re-check: order may have been approved/rejected since the fetch
+        fresh = await db.orders.find_one({"_id": o["_id"], "status": "pending"})
+        if not fresh:
+            await db.orders.update_one(
+                {"_id": o["_id"]},
+                {"$set": {"verify_status": "skipped", "updated_at": now}})
+            continue
+        # one Gmail message may only verify one order
+        used = await db.payverify_logs.find_one({"gmail_msg_id": msg.message_id})
+        if used and used.get("order_id") != fresh.get("order_id"):
+            continue
+        if not used:
+            await db.payverify_logs.insert_one({
+                "gmail_msg_id": msg.message_id,
+                "order_id": fresh.get("order_id"),
+                "purpose": msg.purpose,
+                "amount": str(msg.amount) if msg.amount is not None else None,
+                "matched_at": now,
+            })
+        await db.orders.update_one(
+            {"_id": fresh["_id"]},
+            {"$set": {"verify_status": "verified",
+                      "gmail_msg_id": msg.message_id,
+                      "verify_matched_at": now,
+                      "updated_at": now}})
+
+        # same approval path as manual admin approval (svc + deliver + audit)
+        result = await svc.approve_payment(db, fresh, admin_id)
+        if result is None:
+            continue  # lost a race with manual approve/reject
+        if result.get("error") == "out_of_stock":
+            # keep verify_status pending so a later cycle retries once
+            # stock is replenished; warn the group only once
+            await db.orders.update_one(
+                {"_id": fresh["_id"]},
+                {"$set": {"verify_status": "pending"}})
+            if not fresh.get("verify_stock_warned"):
+                await db.orders.update_one(
+                    {"_id": fresh["_id"]},
+                    {"$set": {"verify_stock_warned": True}})
+                await _verify_group_notice(
+                    bot,
+                    "🤖 <b>AUTO-VERIFY: OUT OF STOCK</b>\n\n"
+                    f"🆔 Order: <code>{fresh['order_id']}</code> — payment matched "
+                    f"(₹{fresh.get('amount',0):.2f}) but no keys available. "
+                    "Order stays pending; will auto-approve when stock is added.")
+            continue
+
+        product = result["product"]
+        delivered = await svc.deliver_order(bot, db, result["order"], product)
+
+        # payment detected -> remove the customer's payment-details message
+        pay_doc = await db.payments.find_one({"order_id": fresh["_id"]})
+        if pay_doc and pay_doc.get("payment_msg_id"):
+            try:
+                await bot.delete_message(
+                    pay_doc.get("payment_chat_id") or fresh.get("telegram_id"),
+                    pay_doc["payment_msg_id"])
+            except Exception:
+                pass
+
+        user = await db.users.find_one({"_id": fresh.get("user_id")})
+        disp = (user or {}).get("first_name") or (user or {}).get("username") or "Customer"
+        uname = (f"@{user['username']}" if user and user.get("username")
+                 else html.escape(str(disp)))
+        key_val = result["key"]["key_value"] if delivered else None
+        try:
+            amt = float(fresh.get("amount") or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        audit = "\n".join([
+            "🤖 <b>AUTO-VERIFIED PAYMENT</b>", "",
+            "👤 <b>User</b>",
+            f"├ Name: {html.escape(str(disp))}",
+            f"├ User ID: <code>{fresh.get('telegram_id')}</code>",
+            f"└ Username: {uname}", "",
+            "💳 <b>Transaction</b>",
+            "├ Method: UPI Auto (Gmail IMAP)",
+            f"├ Order: <code>{fresh['order_id']}</code>",
+            f"├ Product: {html.escape(str(fresh.get('product_name') or ''))}",
+            f"├ Plan: {html.escape(str(fresh.get('plan_name') or ''))}",
+            f"├ Amount: ₹{amt:.2f}",
+            f"├ Note: <code>{html.escape(str(fresh.get('verify_purpose') or ''))}</code>",
+            (f"├ UTR/TXN: <code>{html.escape(str(msg.utr))}</code>"
+             if msg.utr else "├ UTR/TXN: —"),
+            f"├ Gmail ID: <code>{html.escape(str(msg.message_id))}</code>",
+            f"└ Time: {svc.fmt_ist(svc.now_utc())}", "",
+            "🔑 <b>Key</b>",
+            (f"└ <code>{html.escape(str(key_val))}</code>"
+             if key_val else "└ <b>None</b>"), "",
+            f"Delivery: {'✅ sent' if delivered else '⚠️ failed (key released)'}",
+        ])
+        await _verify_group_notice(bot, audit)
+        await admin._log(db, admin_id, "auto_verify_payment",
+                         {"order": fresh["order_id"],
+                          "gmail_msg_id": msg.message_id,
+                          "utr": msg.utr})
+        if not delivered:
+            await admin._notify_customer_text(
+                bot, fresh["telegram_id"],
+                f"⚠️ Your order {fresh['order_id']} is approved but we couldn't "
+                "reach you. Please /start the bot so we can deliver your key.")
+        logger.info("Auto-verified order %s via Gmail msg %s",
+                    fresh["order_id"], msg.message_id)
+
+
+async def payment_verify_job(bot: Bot):
+    """Poll Gmail for FamApp/bank credit alerts and auto-approve matching
+    orders. No-op unless payment_mode=automatic AND IMAP is configured."""
+    from bot import payverify
+    while True:
+        interval = 30
+        try:
+            db = Database.get_db()
+            cfg = payverify.PayVerifyConfig.from_env()
+            interval = max(10, cfg.poll_interval_seconds)
+            mode = await svc.get_payment_mode(db)
+            if mode == "automatic" and cfg.configured:
+                await _payverify_cycle(bot, db, cfg)
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("PayVerify job error: %s", e)
+            await asyncio.sleep(30)
+
+
 async def main():
     await Database.connect()
     db = Database.get_db()
@@ -119,6 +303,7 @@ async def main():
 
     # Expiry job + automatic backups (every 6h)
     expiry_task = asyncio.create_task(payment_expiry_job(bot))
+    verify_task = asyncio.create_task(payment_verify_job(bot))
     from bot.store import get_store
     backup_task = asyncio.create_task(get_store().backup_loop())
 
@@ -127,6 +312,7 @@ async def main():
         await dp.start_polling(bot)
     finally:
         expiry_task.cancel()
+        verify_task.cancel()
         backup_task.cancel()
         await Database.close()
         await bot.session.close()

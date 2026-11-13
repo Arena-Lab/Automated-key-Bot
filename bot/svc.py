@@ -47,6 +47,11 @@ async def get_settings(db) -> Dict[str, Any]:
     return data
 
 
+async def get_payment_mode(db) -> str:
+    s = await get_settings(db)
+    return (s.get("payment_mode") or "manual").lower()
+
+
 async def next_order_id(db) -> str:
     doc = await db.counters.find_one_and_update(
         {"_id": "order"},
@@ -320,15 +325,21 @@ async def deliver_order(bot, db, order: Dict, product: Dict) -> bool:
         )
     except Exception as e:
         # User unreachable (blocked bot etc.) - release the key back to
-        # stock and keep order 'paid' so admin can retry delivery
+        # stock and keep order in fulfillment_pending so admin can retry
         logger.error(f"Key delivery failed for {oid}: {e}")
         if order.get("key_id"):
             await db.keys.update_one(
                 {"_id": order["key_id"]},
                 {"$set": {"status": "available"}, "$unset": {"sold_at": ""}})
-        await db.orders.update_one(
-            {"_id": order["_id"]},
-            {"$set": {"status": "paid", "updated_at": now_utc()}})
+            # clear key fields so a retry can't deliver the same key twice
+            await db.orders.update_one(
+                {"_id": order["_id"]},
+                {"$set": {"status": "paid", "updated_at": now_utc()},
+                 "$unset": {"key_id": "", "key_value": ""}})
+        else:
+            await db.orders.update_one(
+                {"_id": order["_id"]},
+                {"$set": {"status": "paid", "updated_at": now_utc()}})
         return False
 
     await resend_product_files(bot, tid, product or {})

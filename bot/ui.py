@@ -74,6 +74,12 @@ class KB:
         ])
 
     @staticmethod
+    def payment_auto(order_id: str) -> InlineKeyboardMarkup:
+        return _ikb([
+            [InlineKeyboardButton(text="❌ Cancel Payment", callback_data=f"pay_cancel_{order_id}")],
+        ])
+
+    @staticmethod
     def order_actions(order_id: str) -> InlineKeyboardMarkup:
         return _ikb([
             [InlineKeyboardButton(text="🔑 View Key", callback_data=f"key_{order_id}")],
@@ -180,8 +186,10 @@ class KB:
         ])
 
     @staticmethod
-    def settings_menu(maint_on: bool = False) -> InlineKeyboardMarkup:
+    def settings_menu(maint_on: bool = False, pay_mode: str = "manual") -> InlineKeyboardMarkup:
         maint_label = "🔴 Maintenance: ON" if maint_on else "🟢 Maintenance: OFF"
+        man_label = ("✅ " if pay_mode == "manual" else "") + "✋ Manual"
+        auto_label = ("✅ " if pay_mode == "automatic" else "") + "🤖 Automatic"
         return _ikb([
             [InlineKeyboardButton(text="🏪 Shop Name", callback_data="set_name"),
              InlineKeyboardButton(text="👋 Welcome Msg", callback_data="set_welcome")],
@@ -192,7 +200,8 @@ class KB:
             [InlineKeyboardButton(text="📋 Instructions", callback_data="set_instructions"),
              InlineKeyboardButton(text="🔧 Maintenance Msg", callback_data="set_maint")],
             [InlineKeyboardButton(text="🔴 How to Buy Text", callback_data="set_howto")],
-            [InlineKeyboardButton(text="💳 Payment Mode", callback_data="adm_paymode")],
+            [InlineKeyboardButton(text=man_label, callback_data="adm_paymode_manual"),
+             InlineKeyboardButton(text=auto_label, callback_data="adm_paymode_auto")],
             [InlineKeyboardButton(text=maint_label, callback_data="adm_maintoggle")],
             [InlineKeyboardButton(text="🔙 Dashboard", callback_data="adm_dash")],
         ])

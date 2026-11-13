@@ -32,7 +32,7 @@ BACKUP_KEEP = 30                    # retention
 COLLECTIONS = [
     "users", "products", "plans", "keys", "orders", "payments",
     "settings", "resellers", "admin_logs", "tutorial", "counters",
-    "broadcasts",
+    "broadcasts", "payverify_logs",
 ]
 
 
@@ -409,6 +409,8 @@ class Store:
 
     def _connect(self):
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS docs ("
             "collection TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, "

@@ -3,19 +3,20 @@
 import asyncio
 import io
 import logging
-import os
-from datetime import datetime
+from datetime import timedelta
 
 import qrcode
 from aiogram import Router, F, types
 from aiogram.fsm.context import FSMContext
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.types import (InlineKeyboardMarkup, InlineKeyboardButton,
+                           BufferedInputFile)
 from bot.oid import ObjectId
 
 from bot.db import Database
 from bot.ui import KB
 from bot.fsm import CustomerStates
 import bot.svc as svc
+from bot import payverify
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -35,15 +36,30 @@ def _channel_url(raw: str) -> str:
     return f"https://t.me/{raw.lstrip('@')}"
 
 
-def _upi_qr(settings: dict, amount: float, order_id: str) -> bytes:
-    upi = settings.get("upi_id") or Config.UPI_ID
-    payee = settings.get("payee_name") or Config.PAYEE_NAME or "Shop"
-    link = f"upi://pay?pa={upi}&pn={payee}&am={amount}&cu=INR&tn={order_id}"
-    img = qrcode.make(link)
+def _qr_png(data: str) -> bytes:
+    # compact QR - smaller PNG uploads faster to Telegram
+    qr = qrcode.QRCode(box_size=6, border=2)
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img.save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf.read()
+
+
+# Per-user purchase locks - serialize order creation so rapid clicks
+# can never produce two orders for the same purchase action.
+_PURCHASE_LOCKS = {}
+_PURCHASE_LOCKS_GUARD = asyncio.Lock()
+
+
+async def _purchase_lock(tid: int) -> asyncio.Lock:
+    async with _PURCHASE_LOCKS_GUARD:
+        lock = _PURCHASE_LOCKS.get(tid)
+        if lock is None:
+            lock = _PURCHASE_LOCKS[tid] = asyncio.Lock()
+        return lock
 
 
 # ---------------- /start ----------------
@@ -281,21 +297,42 @@ async def cb_plan(callback: types.CallbackQuery, user: dict, state: FSMContext, 
         await callback.message.answer("🔴 Out of stock for this plan.")
         return
 
-    # New purchase => delete old payment messages + cancel previous pending orders
-    old_pending = await db.orders.find(
-        {"telegram_id": user["telegram_id"], "status": "pending"}
-    ).to_list(length=None)
-    for old in old_pending:
-        old_pay = await db.payments.find_one({"order_id": old["_id"]})
-        if old_pay and old_pay.get("payment_msg_id"):
-            try:
-                await callback.bot.delete_message(
-                    old_pay.get("payment_chat_id", user["telegram_id"]),
-                    old_pay["payment_msg_id"])
-            except Exception:
-                pass
-    await svc.cancel_user_pending_orders(db, user["telegram_id"])
-    order = await svc.create_order(user, product, plan, db)
+    # ONE purchase action = ONE order. The per-user lock serializes rapid
+    # clicks; a pending order for the SAME plan is reused (fresh payment
+    # message, same order/QR reference) instead of duplicated.
+    lock = await _purchase_lock(user["telegram_id"])
+    async with lock:
+        existing = await db.orders.find_one({
+            "telegram_id": user["telegram_id"], "status": "pending",
+            "plan_id": plan["_id"]})
+        if existing:
+            order = existing
+            order["payment"] = await db.payments.find_one(
+                {"order_id": existing["_id"]}) or {}
+            old_pay = order["payment"]
+            if old_pay.get("payment_msg_id"):
+                try:
+                    await callback.bot.delete_message(
+                        old_pay.get("payment_chat_id") or user["telegram_id"],
+                        old_pay["payment_msg_id"])
+                except Exception:
+                    pass
+        else:
+            # different plan -> retire old pending orders, then create fresh
+            old_pending = await db.orders.find(
+                {"telegram_id": user["telegram_id"], "status": "pending"}
+            ).to_list(length=None)
+            for old in old_pending:
+                old_pay = await db.payments.find_one({"order_id": old["_id"]})
+                if old_pay and old_pay.get("payment_msg_id"):
+                    try:
+                        await callback.bot.delete_message(
+                            old_pay.get("payment_chat_id", user["telegram_id"]),
+                            old_pay["payment_msg_id"])
+                    except Exception:
+                        pass
+            await svc.cancel_user_pending_orders(db, user["telegram_id"])
+            order = await svc.create_order(user, product, plan, db)
 
     s = await svc.get_settings(db)
     upi = s.get("upi_id") or Config.UPI_ID
@@ -304,42 +341,100 @@ async def cb_plan(callback: types.CallbackQuery, user: dict, state: FSMContext, 
     amount = order["amount"]
     expiry = order["payment"]["expiry_time"]
 
-    caption = (
-        "💳 <b>PAYMENT DETAILS</b>\n\n"
-        f"🎮 {_esc(product['name'])}\n⏱️ {_esc(plan['name'])}\n\n"
-        f"💰 Amount: <b>₹{amount:g}</b>\n"
-        f"🆔 Order ID: <code>{order['order_id']}</code>\n\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        f"🏦 UPI ID: <code>{_esc(upi)}</code>\n"
-        f"👤 Payee: {_esc(payee)}\n\n"
-        f"📌 <b>Instructions:</b>\n{_esc(instr)}\n\n"
-        f"⏳ Expires: {svc.fmt_ist(expiry)}\n"
-        "Order auto-cancels if unpaid."
-    )
+    # Automatic mode: unique purpose note + per-order UPI URI for Gmail
+    # payment-alert matching (bot/payverify.py poller approves on match).
+    # A reused order keeps its existing purpose/URI so the Gmail match still works.
+    pv_cfg = payverify.PayVerifyConfig.from_env()
+    auto_verify = (await svc.get_payment_mode(db) == "automatic")
+    purpose = order.get("verify_purpose") if auto_verify else None
+    verify_expires = order.get("verify_expires_at") if purpose else None
+    if auto_verify and not purpose:
+        purpose = payverify.generate_purpose(pv_cfg.purpose_prefix)
+        verify_expires = svc.now_utc() + timedelta(
+            minutes=pv_cfg.order_expiry_minutes)
+    # dynamic per-order UPI URI for BOTH modes - QR carries exact amount
+    # plus a note (purpose in auto mode, order id in manual mode)
+    upi_id = pv_cfg.default_upi_id or upi
+    payee_name = pv_cfg.payee_name or payee
+    upi_uri = order.get("upi_uri") or payverify.build_upi_uri(
+        upi_id, payee_name,
+        payverify.parse_amount(amount), purpose or order["order_id"])
+    if auto_verify and not order.get("verify_purpose"):
+        await db.orders.update_one(
+            {"_id": order["_id"]},
+            {"$set": {
+                "verify_purpose": purpose,
+                "verify_created_at": svc.now_utc(),
+                "verify_expires_at": verify_expires,
+                "verify_status": "pending",
+                "upi_uri": upi_uri,
+                "updated_at": svc.now_utc(),
+            }})
+        # keep the order payable for the whole verify window
+        await db.payments.update_one(
+            {"public_order_id": order["order_id"]},
+            {"$set": {"expiry_time": verify_expires,
+                      "updated_at": svc.now_utc()}})
+    if auto_verify and verify_expires:
+        expiry = verify_expires
 
-    # QR code: prefer the configured image file, fall back to generated UPI QR
-    qr_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "..", "..", "payment images", "fampay_qr.jpg",
-    )
+    pay_kb = KB.payment_auto(order["order_id"]) if purpose \
+        else KB.payment(order["order_id"])
+
+    if purpose:
+        # compact auto-verify payment message
+        try:
+            mins = max(1, int((expiry - svc.now_utc()).total_seconds() // 60))
+        except Exception:
+            mins = pv_cfg.order_expiry_minutes
+        caption = (
+            f"🎮 <b>Game:</b> {_esc(product['name'])}\n"
+            f"⏱️ <b>Plan:</b> {_esc(plan['name'])}\n\n"
+            f"💸 <b>Scan & Pay Exactly:</b> ₹{float(amount):.2f}\n\n"
+            f"🆔 <b>Order ID:</b> <code>{order['order_id']}</code>\n"
+            f"⏰ <b>Valid for {mins} minutes</b>\n\n"
+            "Your key is sent automatically once payment is detected."
+        )
+    else:
+        caption = (
+            "💳 <b>PAYMENT DETAILS</b>\n\n"
+            f"🎮 {_esc(product['name'])}\n⏱️ {_esc(plan['name'])}\n\n"
+            f"💰 Amount: <b>₹{amount:g}</b>\n"
+            f"🆔 Order ID: <code>{order['order_id']}</code>\n\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"🏦 UPI ID: <code>{_esc(upi)}</code>\n"
+            f"👤 Payee: {_esc(payee)}\n\n"
+            f"📌 <b>Instructions:</b>\n{_esc(instr)}\n\n"
+            f"⏳ Expires: {svc.fmt_ist(expiry)}\n"
+            "Order auto-cancels if unpaid."
+        )
+
+    # QR code: single send attempt - generated per-order UPI QR. On ANY
+    # failure send text-only payment info; never chain photo fallbacks
+    # (a timed-out send may still deliver -> duplicate messages/orders).
     try:
-        if os.path.exists(qr_path):
+        qr_bytes = await asyncio.to_thread(_qr_png, upi_uri)
+    except Exception as e:
+        logger.warning("QR generation failed: %s", e)
+        qr_bytes = None
+    try:
+        if qr_bytes:
             sent = await callback.message.answer_photo(
-                FSInputFile(qr_path), caption=caption, parse_mode="HTML",
-                reply_markup=KB.payment(order["order_id"]),
+                BufferedInputFile(qr_bytes, filename="qr.png"),
+                caption=caption, parse_mode="HTML", reply_markup=pay_kb,
             )
         else:
-            raise FileNotFoundError(qr_path)
-    except Exception:
+            sent = await callback.message.answer(
+                caption, parse_mode="HTML", reply_markup=pay_kb)
+    except Exception as e:
+        logger.warning("Payment message send failed: %s", e)
         try:
-            qr = _upi_qr(s, amount, order["order_id"])
-            sent = await callback.message.answer_photo(
-                io.BytesIO(qr), caption=caption, parse_mode="HTML",
-                reply_markup=KB.payment(order["order_id"]),
-            )
+            sent = await callback.message.answer(
+                caption, parse_mode="HTML", reply_markup=pay_kb)
         except Exception:
-            sent = await callback.message.answer(caption, parse_mode="HTML",
-                                                  reply_markup=KB.payment(order["order_id"]))
+            sent = None
+    if sent is None:
+        return
 
     # Persist message id so it can be deleted on cancel/expiry/new order
     pay_doc = await db.payments.find_one({"public_order_id": order["order_id"]})
@@ -416,13 +511,7 @@ async def msg_utr(message: types.Message, state: FSMContext, user: dict, db):
 
     pay = await db.payments.find_one({"public_order_id": order_id})
     if pay:
-        try:
-            await svc.submit_payment_details(db, pay["_id"], utr=utr)
-        except DuplicateKeyError:
-            # Lost a race - another payment grabbed this UTR first
-            await message.answer("❌ This UTR was already submitted for another order.")
-            await state.clear()
-            return
+        await svc.submit_payment_details(db, pay["_id"], utr=utr)
 
     await state.clear()
     await message.answer(
