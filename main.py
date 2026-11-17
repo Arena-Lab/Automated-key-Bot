@@ -14,6 +14,7 @@ from config import Config
 from bot.db import Database
 from bot.middleware import AuthMiddleware, MaintenanceMiddleware
 from bot.handlers import customer, admin, reseller
+from bot.handlers import reseller_shop, reseller_admin
 import bot.svc as svc
 
 logging.basicConfig(
@@ -278,6 +279,15 @@ async def main():
         "maintenance_mode": False,
         "maintenance_message": "🔧 Bot is under maintenance. Please try later.",
         "reseller_enabled": Config.RESELLER_SYSTEM_ENABLED,
+        "reseller_apps_enabled": True,
+        "reseller_purchases_enabled": True,
+        "reseller_codes_enabled": True,
+        "reseller_individual_pricing": True,
+        "reseller_stats_enabled": True,
+        "reseller_min_enabled": True,
+        "reseller_min_cents": 30000,
+        "reseller_min_scope": "all",
+        "reseller_allow_negative": False,
         "how_to_text": None,
     }
     for k, v in defaults.items():
@@ -300,6 +310,8 @@ async def main():
     dp.include_router(customer.router)
     dp.include_router(admin.router)
     dp.include_router(reseller.router)
+    dp.include_router(reseller_shop.router)
+    dp.include_router(reseller_admin.router)
 
     # Expiry job + automatic backups (every 6h)
     expiry_task = asyncio.create_task(payment_expiry_job(bot))

@@ -205,25 +205,28 @@ async def rb_howto(message: types.Message, state: FSMContext, db):
         await message.answer(text, parse_mode="HTML", reply_markup=KB.reply_menu())
 
 
-@router.message(F.text == "🤝 Join Reseller")
-async def rb_reseller(message: types.Message, user: dict, state: FSMContext, db):
+@router.message(F.text == "👑 Resellers")
+async def rb_reseller(message: types.Message, user: dict, state: FSMContext, db,
+                      is_admin: bool = False):
     await state.clear()
+    if is_admin:
+        from bot.handlers import reseller_admin
+        await reseller_admin.send_admin_panel(message, db)
+        return
     s = await svc.get_settings(db)
     if not s.get("reseller_enabled", Config.RESELLER_SYSTEM_ENABLED):
         await message.answer("🎁 Reseller program is currently closed.")
         return
     r = await db.resellers.find_one({"telegram_id": user["telegram_id"]})
     if r and r.get("status") == "active":
-        await message.answer(
-            f"🎁 <b>RESELLER DASHBOARD</b>\n\n"
-            f"Code: <code>{r.get('reseller_code','-')}</code>\n"
-            f"Discount: {r.get('discount_percentage',0)}%\n"
-            f"Balance: ₹{r.get('balance',0):.2f}",
-            parse_mode="HTML",
-        )
+        from bot.handlers import reseller_shop
+        await reseller_shop._send_panel(message, db, r)
         return
     if r and r.get("status") == "pending":
         await message.answer("⏳ Your reseller application is under review.")
+        return
+    if not s.get("reseller_apps_enabled", True):
+        await message.answer("🎁 Reseller applications are currently closed.")
         return
     await message.answer(
         "🎁 <b>JOIN RESELLER PROGRAM</b>\n\nEarn discounts on every purchase!",
@@ -491,7 +494,7 @@ async def msg_utr(message: types.Message, state: FSMContext, user: dict, db):
     utr = (message.text or "").strip()
 
     if utr.startswith("/") or utr in ("🛍️ Purchase Keys", "🤑 Purchase Keys", "🔑 My Keys", "🪙 My Keys",
-                                      "🎁 Setup Channel", "📞 Owner Contact", "🔴 How to Buy?", "🤝 Join Reseller"):
+                                      "🎁 Setup Channel", "📞 Owner Contact", "🔴 How to Buy?", "👑 Resellers"):
         await state.clear()
         await message.answer("Payment session ended.", reply_markup=KB.reply_menu())
         return
@@ -801,6 +804,9 @@ async def cb_res_apply(callback: types.CallbackQuery, user: dict, state: FSMCont
     s = await svc.get_settings(db)
     if not s.get("reseller_enabled", Config.RESELLER_SYSTEM_ENABLED):
         await callback.message.answer("Reseller program closed.")
+        return
+    if not s.get("reseller_apps_enabled", True):
+        await callback.answer("Reseller applications are currently closed.", show_alert=True)
         return
     existing = await db.resellers.find_one({"telegram_id": user["telegram_id"]})
     if existing:

@@ -32,7 +32,7 @@ BACKUP_KEEP = 30                    # retention
 COLLECTIONS = [
     "users", "products", "plans", "keys", "orders", "payments",
     "settings", "resellers", "admin_logs", "tutorial", "counters",
-    "broadcasts", "payverify_logs",
+    "broadcasts", "payverify_logs", "wallet_txns", "redeem_codes",
 ]
 
 

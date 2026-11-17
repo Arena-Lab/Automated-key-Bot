@@ -29,7 +29,7 @@ class KB:
                 [KeyboardButton(text="🛍️ Purchase Keys"), KeyboardButton(text="🔑 My Keys")],
                 [KeyboardButton(text="🎁 Setup Channel"), KeyboardButton(text="📞 Owner Contact")],
                 [KeyboardButton(text="🔴 How to Buy?")],
-                [KeyboardButton(text="🤝 Join Reseller")],
+                [KeyboardButton(text="👑 Resellers")],
             ],
             resize_keyboard=True,
         )

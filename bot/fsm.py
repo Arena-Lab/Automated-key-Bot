@@ -33,3 +33,21 @@ class AdminStates(StatesGroup):
     promo_text = State()
     revenue_edit = State()
     edit_setting = State()
+    # reseller admin
+    rs_amount = State()
+    rs_search = State()
+    rs_code_amount = State()
+    rs_code_expiry = State()
+    rs_code_bulk = State()
+    rs_price_plan = State()
+    rs_price_value = State()
+    rs_override_reseller = State()
+    rs_override_plan = State()
+    rs_override_value = State()
+    rs_suspend_reason = State()
+    rs_min_recharge = State()
+
+
+class ResellerStates(StatesGroup):
+    redeem_code = State()
+    buy_confirm = State()
