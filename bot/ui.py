@@ -193,8 +193,9 @@ class KB:
         return _ikb([
             [InlineKeyboardButton(text="🏪 Shop Name", callback_data="set_name"),
              InlineKeyboardButton(text="👋 Welcome Msg", callback_data="set_welcome")],
-            [InlineKeyboardButton(text="📢 Channel", callback_data="set_channel"),
-             InlineKeyboardButton(text="📞 Support", callback_data="set_support")],
+            [InlineKeyboardButton(text="📢 Official Channel", callback_data="set_channel"),
+             InlineKeyboardButton(text="🎁 Setup Channel", callback_data="set_setup")],
+            [InlineKeyboardButton(text="📞 Support", callback_data="set_support")],
             [InlineKeyboardButton(text="🏦 UPI ID", callback_data="set_upi"),
              InlineKeyboardButton(text="👤 Payee Name", callback_data="set_payee")],
             [InlineKeyboardButton(text="📋 Instructions", callback_data="set_instructions"),

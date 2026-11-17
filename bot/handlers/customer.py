@@ -160,7 +160,7 @@ async def rb_my_keys(message: types.Message, user: dict, state: FSMContext, db):
 async def rb_channel(message: types.Message, state: FSMContext, db):
     await state.clear()
     s = await svc.get_settings(db)
-    url = _channel_url(s.get("official_channel") or Config.OFFICIAL_CHANNEL)
+    url = _channel_url(s.get("setup_channel") or s.get("official_channel") or Config.OFFICIAL_CHANNEL)
     if url:
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
         await message.answer(

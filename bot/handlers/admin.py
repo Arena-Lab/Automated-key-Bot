@@ -2052,6 +2052,7 @@ SETTING_LABELS = {
     "name": ("shop_name", "🏪 Shop Name"),
     "welcome": ("welcome_message", "👋 Welcome Message"),
     "channel": ("official_channel", "📢 Official Channel (@name or link)"),
+    "setup": ("setup_channel", "🎁 Setup Channel (@name or link)"),
     "support": ("support_username", "📞 Support Username (@name)"),
     "upi": ("upi_id", "🏦 UPI ID"),
     "payee": ("payee_name", "👤 Payee Name"),
