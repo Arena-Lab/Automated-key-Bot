@@ -264,7 +264,8 @@ async def cb_stats(callback: types.CallbackQuery, db):
         f"💳 Payment Mode   <b>{mode}</b>\n"
         f"🔧 Maintenance    <b>{maint}</b>",
         parse_mode="HTML", reply_markup=_kb([
-            [InlineKeyboardButton(text="✏️ Edit Revenue", callback_data="adm_revset")],
+            [InlineKeyboardButton(text="✏️ Edit Revenue", callback_data="adm_revset"),
+             InlineKeyboardButton(text="🔄 Reset Stats", callback_data="adm_stats_reset")],
             [InlineKeyboardButton(text="🔙 Dashboard", callback_data="adm_dash")],
         ]))
 
@@ -328,6 +329,47 @@ async def st_revset(m, state, db):
     await m.answer(f"✅ Total revenue set to ₹{val:.2f} <i>(manual)</i>",
                    parse_mode="HTML",
                    reply_markup=KB.back_nav("adm_stats", "🔙 Stats"))
+
+
+# ---------- Reset stats (wipe test data, keep catalog) ----------
+
+@router.callback_query(F.data == "adm_stats_reset")
+async def cb_stats_reset(callback: types.CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        "⚠️ <b>RESET ALL STATS?</b>\n\n"
+        "This permanently deletes:\n"
+        "• All users (test IDs included)\n"
+        "• All orders & payments\n"
+        "• Blocked-user list\n\n"
+        "Sold keys go back to <b>available</b> so stock is restored.\n\n"
+        "<b>Kept intact:</b> products, plans, key values, settings.\n\n"
+        "Revenue resets to ₹0. <b>Cannot be undone</b> — only use for test data!",
+        parse_mode="HTML",
+        reply_markup=KB.yes_no("adm_stats_reset_yes", "adm_stats"))
+
+
+@router.callback_query(F.data == "adm_stats_reset_yes")
+async def cb_stats_reset_yes(callback: types.CallbackQuery, db):
+    await callback.answer("Resetting...")
+    await db.users.delete_many({})
+    await db.orders.delete_many({})
+    await db.payments.delete_many({})
+    res = await db.keys.update_many(
+        {"status": "sold"}, {"$set": {"status": "available"}})
+    await db.settings.update_one({"key": "revenue_manual"},
+                                 {"$unset": {"value": ""}})
+    svc.invalidate_settings()
+    await _log(db, callback.from_user.id, "reset_stats",
+               {"keys_restored": res.modified_count})
+    await callback.message.answer(
+        f"✅ <b>Stats reset complete</b>\n\n"
+        f"🔑 {res.modified_count} sold key(s) restored to available\n"
+        f"📊 Users, orders, payments → 0\n"
+        f"💰 Revenue → ₹0\n\n"
+        "Products & settings untouched.",
+        parse_mode="HTML",
+        reply_markup=KB.back_nav("adm_stats", "🔙 Stats"))
 
 
 # ================= Products =================
