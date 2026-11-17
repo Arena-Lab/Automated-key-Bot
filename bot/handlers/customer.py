@@ -294,7 +294,11 @@ async def cb_plan(callback: types.CallbackQuery, user: dict, state: FSMContext, 
         await callback.message.answer("❌ Product unavailable.")
         return
     if await svc.stock_for_plan(db, plan["_id"]) <= 0:
-        await callback.message.answer("🔴 Out of stock for this plan.")
+        s = await svc.get_settings(db)
+        admin = (s.get("support_username") or "").strip().lstrip("@") or "zerotrace0x"
+        await callback.message.answer(
+            f"🔴 Out of stock for this plan.\n\n📞 Contact admin: @{admin}",
+            reply_markup=KB.reply_menu())
         return
 
     # ONE purchase action = ONE order. The per-user lock serializes rapid
