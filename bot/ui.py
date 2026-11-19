@@ -92,7 +92,9 @@ class KB:
              InlineKeyboardButton(text="🛍️ Products", callback_data="adm_products")],
             [InlineKeyboardButton(text="📦 Orders", callback_data="adm_orders"),
              InlineKeyboardButton(text="👥 Customers", callback_data="adm_customers")],
-            [InlineKeyboardButton(text="📁 Files", callback_data="adm_files")],
+            [InlineKeyboardButton(text="📁 Files", callback_data="adm_files"),
+             InlineKeyboardButton(text="🔑 Key Backup", callback_data="adm_keybackup")],
+            [InlineKeyboardButton(text="🗄 Database Backup", callback_data="adm_dbbak")],
             [InlineKeyboardButton(text="📢 Broadcast", callback_data="adm_broadcast"),
              InlineKeyboardButton(text="🎯 Promo", callback_data="adm_promo")],
             [InlineKeyboardButton(text="🔄 Restart", callback_data="adm_restart"),
@@ -168,8 +170,10 @@ class KB:
         ])
 
     @staticmethod
-    def settings_menu(maint_on: bool = False) -> InlineKeyboardMarkup:
+    def settings_menu(maint_on: bool = False,
+                      db_backup_on: bool = True) -> InlineKeyboardMarkup:
         maint_label = "🔴 Maintenance: ON" if maint_on else "🟢 Maintenance: OFF"
+        db_label = "🗄 DB Backup: ON" if db_backup_on else "🗄 DB Backup: OFF"
         return _ikb([
             [InlineKeyboardButton(text="🏪 Shop Name", callback_data="set_name"),
              InlineKeyboardButton(text="👋 Welcome Msg", callback_data="set_welcome")],
@@ -178,6 +182,7 @@ class KB:
             [InlineKeyboardButton(text="📞 Support", callback_data="set_support"),
              InlineKeyboardButton(text="🔧 Maintenance Msg", callback_data="set_maint")],
             [InlineKeyboardButton(text="🔴 How to Buy Text", callback_data="set_howto")],
+            [InlineKeyboardButton(text=db_label, callback_data="adm_dbbak_toggle")],
             [InlineKeyboardButton(text=maint_label, callback_data="adm_maintoggle")],
             [InlineKeyboardButton(text="🔙 Dashboard", callback_data="adm_dash")],
         ])

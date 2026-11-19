@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ErrorEvent
+from aiogram.types import ErrorEvent, BufferedInputFile
 
 from config import Config
 from bot.db import Database
@@ -260,6 +260,95 @@ async def payment_verify_job(bot: Bot):
             await asyncio.sleep(30)
 
 
+async def db_backup_job(bot: Bot):
+    """Send a raw store.db snapshot to the configured group every day at
+    00:00 IST. Controlled by the persistent `db_backup_enabled` setting
+    (default on; survives restarts)."""
+    import os
+    import sqlite3
+    import tempfile
+    from datetime import timedelta
+    from bot.store import DB_PATH
+
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+    while True:
+        try:
+            db = Database.get_db()
+            now = svc.now_utc()
+            ist_now = now + IST_OFFSET
+            next_midnight_ist = (ist_now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+            target_utc = next_midnight_ist - IST_OFFSET
+            wait = max(1.0, (target_utc - now).total_seconds()) + 2
+            await asyncio.sleep(wait)
+
+            # up to 3 attempts 5 min apart so a transient Telegram/network
+            # error doesn't cost the whole day's backup
+            for attempt in range(3):
+                try:
+                    s = await svc.get_settings(db)
+                    if not s.get("db_backup_enabled", True):
+                        logger.info("DB backup skipped - disabled in settings")
+                        break
+                    chat_id = Config.DB_BACKUP_GROUP_ID
+                    if not chat_id:
+                        logger.warning("DB backup skipped - "
+                                       "STORE_DATABASE_BACKUP not configured")
+                        break
+                    if not os.path.exists(DB_PATH):
+                        logger.error("DB backup failed - %s not found", DB_PATH)
+                        break
+
+                    def _snapshot() -> bytes:
+                        # sqlite3 online backup API - consistent copy while
+                        # the bot runs; committed WAL is included automatically.
+                        tmp = tempfile.NamedTemporaryFile(
+                            delete=False, suffix=".db",
+                            dir=os.path.dirname(DB_PATH) or None)
+                        tmp.close()
+                        try:
+                            src = sqlite3.connect(DB_PATH)
+                            dst = sqlite3.connect(tmp.name)
+                            try:
+                                src.backup(dst)
+                            finally:
+                                dst.close()
+                                src.close()
+                            with open(tmp.name, "rb") as f:
+                                return f.read()
+                        finally:
+                            try:
+                                os.remove(tmp.name)
+                            except OSError:
+                                pass
+
+                    data = await asyncio.to_thread(_snapshot)
+                    fname = (f"store_backup_"
+                             f"{svc.now_utc().strftime('%Y%m%d_%H%M')}.db")
+                    await bot.send_document(
+                        chat_id, BufferedInputFile(data, filename=fname),
+                        caption=(f"🗄 <b>DAILY DATABASE BACKUP</b>\n\n"
+                                 f"📦 Size: {len(data) / (1024 * 1024):.2f} MB\n"
+                                 f"🕐 {svc.fmt_ist(svc.now_utc())} IST\n\n"
+                                 "<b>Restore:</b> stop the bot → replace "
+                                 "<code>data/store.db</code> with this file → "
+                                 "start the bot."))
+                    logger.info("Daily DB backup sent to %s (%d bytes)",
+                                chat_id, len(data))
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error("DB backup attempt %d failed: %s",
+                                 attempt + 1, e)
+                    await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("DB backup job error: %s", e)
+            await asyncio.sleep(300)
+
+
 async def main():
     await Database.connect()
     db = Database.get_db()
@@ -284,6 +373,7 @@ async def main():
         "reseller_min_scope": "all",
         "reseller_allow_negative": False,
         "how_to_text": None,
+        "db_backup_enabled": True,
     }
     for k, v in defaults.items():
         if v is None:
@@ -313,6 +403,7 @@ async def main():
     verify_task = asyncio.create_task(payment_verify_job(bot))
     from bot.store import get_store
     backup_task = asyncio.create_task(get_store().backup_loop())
+    dbbak_task = asyncio.create_task(db_backup_job(bot))
 
     logger.info("Bot started successfully!")
     try:
@@ -321,6 +412,7 @@ async def main():
         expiry_task.cancel()
         verify_task.cancel()
         backup_task.cancel()
+        dbbak_task.cancel()
         await Database.close()
         await bot.session.close()
 

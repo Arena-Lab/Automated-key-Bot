@@ -31,6 +31,16 @@ class Config:
     BROADCAST_CHUNK_SIZE: int = int(os.getenv("BROADCAST_CHUNK_SIZE", "50"))
     BROADCAST_DELAY_SECONDS: int = int(os.getenv("BROADCAST_DELAY_SECONDS", "1"))
 
+    # Daily raw store.db backup target chat/group (0 = feature off)
+    @staticmethod
+    def _env_int(name: str, default: int = 0) -> int:
+        try:
+            return int(os.getenv(name, "") or default)
+        except (TypeError, ValueError):
+            return default
+
+    DB_BACKUP_GROUP_ID: int = _env_int("STORE_DATABASE_BACKUP")
+
     # Reseller Configuration
     RESELLER_SYSTEM_ENABLED: bool = (
         os.getenv("RESELLER_SYSTEM_ENABLED", "false").lower() == "true"

@@ -1,21 +1,27 @@
 """Admin panel - complete Telegram-based management (all actions send new messages)"""
 
 import asyncio
+import csv
 import hashlib
+import io
 import logging
 import os
 import re
+import sqlite3
+import tempfile
 from datetime import datetime
 
 from aiogram import Router, F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (InlineKeyboardMarkup, InlineKeyboardButton,
+                           BufferedInputFile)
 from bot.oid import ObjectId
 
 from bot.ui import KB
 from bot.fsm import AdminStates
 import bot.svc as svc
+import bot.store as store
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -1290,6 +1296,109 @@ async def cb_key_unlock_ok(callback: types.CallbackQuery, db):
         parse_mode="HTML", reply_markup=kb)
 
 
+# ---- full inventory backup (CSV document) ----
+
+@router.callback_query(F.data == "adm_keybackup")
+async def cb_key_backup(callback: types.CallbackQuery, db):
+    await callback.answer("Preparing key backup…")
+    products = await db.products.find({}).to_list(500)
+    plans = await db.plans.find({}).to_list(1000)
+    keys = await db.keys.find({}).to_list(length=None)
+
+    prod_by_id = {_norm_id(p["_id"]): p for p in products}
+    plan_by_code = {_cbid(pl["_id"]): pl for pl in plans}
+
+    def _validity(pl):
+        h = pl.get("duration_hours")
+        if h:
+            d = h / 24
+            return f"{int(d)}d" if float(d).is_integer() else f"{h}h"
+        return "-"
+
+    rows, avail, sold = [], 0, 0
+    for k in keys:
+        pl = plan_by_code.get(_cbid(k.get("plan_id"))) or {}
+        prod = prod_by_id.get(_norm_id(k.get("product_id"))) or \
+            prod_by_id.get(_norm_id(pl.get("product_id"))) or {}
+        status = str(k.get("status") or "?").upper()
+        if status == "AVAILABLE":
+            avail += 1
+        elif status == "SOLD":
+            sold += 1
+        rows.append([
+            prod.get("name") or "Unknown",
+            pl.get("name") or "Unknown",
+            _validity(pl),
+            status,
+            k.get("key_value") or "",
+            svc.fmt_ist(k.get("sold_at")) if k.get("sold_at") else "",
+        ])
+    # group by product -> plan; available keys before sold inside each group
+    rows.sort(key=lambda r: (r[0].lower(), r[1].lower(), r[3] != "AVAILABLE"))
+
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["Product", "Plan", "Validity", "Status", "Key", "Sold At"])
+    w.writerows(rows)
+    data = buf.getvalue().encode("utf-8")
+
+    fname = f"keys_backup_{svc.now_utc().strftime('%Y%m%d_%H%M')}.csv"
+    await _log(db, callback.from_user.id, "key_backup",
+               {"total": len(rows), "available": avail, "sold": sold})
+    await callback.message.answer_document(
+        BufferedInputFile(data, filename=fname),
+        caption=(f"🔑 <b>KEY BACKUP</b>\n\n"
+                 f"📦 {len(rows)} keys total\n"
+                 f"🟢 {avail} available | 🔒 {sold} sold\n\n"
+                 f"<i>Generated {svc.fmt_ist(svc.now_utc())}</i>"),
+        parse_mode="HTML")
+
+
+# ---- full database backup (raw .db snapshot) ----
+
+@router.callback_query(F.data == "adm_dbbak")
+async def cb_db_backup(callback: types.CallbackQuery, db):
+    await callback.answer("Preparing database backup…")
+    src_path = store.DB_PATH
+    if not os.path.exists(src_path):
+        await callback.message.answer("❌ Database file not found.")
+        return
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".db", dir=os.path.dirname(src_path) or None)
+    tmp.close()
+    try:
+        # sqlite3 online backup API - consistent snapshot even while the
+        # bot is running; committed WAL content is included automatically.
+        src = sqlite3.connect(src_path)
+        dst = sqlite3.connect(tmp.name)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        with open(tmp.name, "rb") as f:
+            data = f.read()
+    finally:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+
+    size_mb = len(data) / (1024 * 1024)
+    fname = f"store_backup_{svc.now_utc().strftime('%Y%m%d_%H%M')}.db"
+    await _log(db, callback.from_user.id, "db_backup",
+               {"size_bytes": len(data)})
+    await callback.message.answer_document(
+        BufferedInputFile(data, filename=fname),
+        caption=(f"🗄 <b>DATABASE BACKUP</b>\n\n"
+                 f"📦 Size: {size_mb:.2f} MB\n"
+                 f"🕐 {svc.fmt_ist(svc.now_utc())}\n\n"
+                 "<b>Restore:</b> stop the bot → replace <code>data/store.db</code> "
+                 "with this file → start the bot. All keys, users, orders and "
+                 "settings come back exactly as they are."),
+        parse_mode="HTML")
+
+
 # ---- duplicate-key prompts (while in adding_keys state) ----
 
 @router.callback_query(F.data.startswith("adm_dupadd_"))
@@ -1904,7 +2013,8 @@ SETTING_LABELS = {
 
 async def _settings_kb(db):
     s = await svc.get_settings(db)
-    return KB.settings_menu(bool(s.get("maintenance_mode")))
+    return KB.settings_menu(bool(s.get("maintenance_mode")),
+                             bool(s.get("db_backup_enabled", True)))
 
 
 @router.callback_query(F.data == "adm_settings")
@@ -1948,6 +2058,20 @@ async def cb_maintoggle(callback: types.CallbackQuery, db):
     await db.settings.update_one({"key": "maintenance_mode"},
         {"$set": {"key": "maintenance_mode", "value": new, "updated_at": svc.now_utc()}}, upsert=True)
     await _log(db, callback.from_user.id, "maintenance", {"on": new})
+    svc.invalidate_settings()
+    await callback.message.edit_text("⚙️ <b>BOT SETTINGS</b>", parse_mode="HTML",
+                                     reply_markup=await _settings_kb(db))
+
+
+@router.callback_query(F.data == "adm_dbbak_toggle")
+async def cb_dbbak_toggle(callback: types.CallbackQuery, db):
+    await callback.answer()
+    cur = await db.settings.find_one({"key": "db_backup_enabled"})
+    new = not bool(cur.get("value", True)) if cur else False
+    await db.settings.update_one({"key": "db_backup_enabled"},
+        {"$set": {"key": "db_backup_enabled", "value": new,
+                  "updated_at": svc.now_utc()}}, upsert=True)
+    await _log(db, callback.from_user.id, "db_backup_toggle", {"on": new})
     svc.invalidate_settings()
     await callback.message.edit_text("⚙️ <b>BOT SETTINGS</b>", parse_mode="HTML",
                                      reply_markup=await _settings_kb(db))
