@@ -3,6 +3,7 @@
 import asyncio
 import io
 import logging
+import math
 from datetime import timedelta
 
 import qrcode
@@ -375,7 +376,7 @@ async def cb_plan(callback: types.CallbackQuery, user: dict, state: FSMContext, 
 
     expiry = verify_expires
     try:
-        mins = max(1, int((expiry - svc.now_utc()).total_seconds() // 60))
+        mins = max(1, math.ceil((expiry - svc.now_utc()).total_seconds() / 60))
     except Exception:
         mins = pv_cfg.order_expiry_minutes
     caption = (
