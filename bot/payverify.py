@@ -12,7 +12,7 @@ How it works:
   3. ``GmailService`` polls that inbox over IMAP-SSL, parses incoming payment
      emails, and matches on purpose-note + amount (fallback: amount-only within
      a 10-minute window for UPI apps that strip the note).
-  4. ``verify_order`` returns a GmailMessage on match; the caller is
+  4. ``find_matching_payments`` returns GmailMessage matches; the caller is
      responsible for persisting verification logs (message-id dedup) and
      approving the order.
 """
@@ -309,19 +309,6 @@ class GmailService:
             except Exception:
                 pass
 
-    def find_matching_incoming_payment(
-        self, *, order_created_at: datetime, expected_purpose: str,
-        expected_amount: Decimal,
-    ) -> GmailMessage | None:
-        """Pass 1: purpose note + amount. Pass 2: amount-only, 10-min window
-        (for UPI apps that strip the payment note)."""
-        messages = self.search_incoming_payments(
-            lookback_hours=self._config.lookback_hours)
-        return self.match_messages(
-            messages, order_created_at=order_created_at,
-            expected_purpose=expected_purpose,
-            expected_amount=expected_amount)
-
     def match_messages(
         self, messages: list[GmailMessage], *, order_created_at: datetime,
         expected_purpose: str, expected_amount: Decimal,
@@ -360,18 +347,6 @@ class GmailService:
 # ---------------------------------------------------------------------------
 # Async wrapper — imaplib is blocking, always call via asyncio.to_thread
 # ---------------------------------------------------------------------------
-
-async def find_matching_payment(config: PayVerifyConfig, *, order_created_at,
-                                expected_purpose: str, expected_amount) -> GmailMessage | None:
-    svc = GmailService(config)
-    amount = parse_amount(expected_amount)
-    return await asyncio.to_thread(
-        svc.find_matching_incoming_payment,
-        order_created_at=order_created_at,
-        expected_purpose=expected_purpose,
-        expected_amount=amount,
-    )
-
 
 async def find_matching_payments(config: PayVerifyConfig, candidates) -> dict:
     """Batch match: ONE mailbox scan for many orders.

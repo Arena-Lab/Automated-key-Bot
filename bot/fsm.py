@@ -3,11 +3,6 @@
 from aiogram.fsm.state import State, StatesGroup
 
 
-class CustomerStates(StatesGroup):
-    waiting_for_utr = State()
-    waiting_for_screenshot = State()
-
-
 class AdminStates(StatesGroup):
     product_name = State()
     product_platform = State()

@@ -450,7 +450,7 @@ class Store:
 
     # ---------- backups ----------
 
-    async def backup_now(self, tag: str = "manual") -> Optional[str]:
+    async def backup_now(self, tag: str = "snapshot") -> Optional[str]:
         """Snapshot all collections to backups/automatic/<ts>_<tag>/"""
         stamp = _now().strftime("%Y%m%d_%H%M%S")
         dest = os.path.join(BACKUP_DIR, f"{stamp}_{tag}")

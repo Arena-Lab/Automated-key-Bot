@@ -13,7 +13,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from bot.oid import ObjectId
 
-from bot.db import Database
 from bot.ui import KB
 from bot.fsm import AdminStates
 import bot.svc as svc
@@ -171,7 +170,7 @@ async def cmd_admin_help(message: types.Message):
         "📖 <b>ADMIN COMMANDS & USAGE</b>\n\n"
         "<b>Commands</b>\n"
         "• <code>/admin</code> — opens the main control panel (dashboard with all sections)\n"
-        "• <code>/settings</code> — quick settings menu (shop name, messages, payment mode, maintenance)\n"
+        "• <code>/settings</code> — quick settings menu (shop name, messages, UPI fallback, maintenance)\n"
         "• <code>/adminhelp</code> — this help page\n\n"
         "<b>User moderation</b>\n"
         "• <code>/blockuser USER_ID</code> — block a user; the bot stops responding to them completely "
@@ -179,7 +178,7 @@ async def cmd_admin_help(message: types.Message):
         "• <code>/unblockuser USER_ID</code> — restore a blocked user's access.\n"
         "• <code>/blockedusers</code> — list all currently blocked users with their IDs.\n\n"
         "<b>Panel sections (inside /admin)</b>\n"
-        "• 💳 <b>Payments</b> — approve/reject UPI payments; approving delivers key + APK + video automatically\n"
+        "• 💳 <b>Payments</b> — automatic UPI verification via Gmail; orders and payment status are under Orders\n"
         "• 🛍️ <b>Products</b> — add/edit/hide/delete products, manage plans & prices, manage keys\n"
         "• 📁 <b>Files & Links</b> — upload APK + setup video per product, how-to-buy video, product links\n"
         "• 👥 <b>Users</b> — view customers, search orders, block/unblock from customer profile\n"
@@ -245,7 +244,6 @@ async def cb_stats(callback: types.CallbackQuery, db):
     if manual_rev is not None:
         rev_line += "  <i>(manual override)</i>"
     maint = "🔴 ON" if s.get("maintenance_mode") else "🟢 OFF"
-    mode = "🤖 Automatic" if s.get("payment_mode") == "automatic" else "✋ Manual"
     await callback.message.edit_text(
         "📊 <b>STATISTICS</b>\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
@@ -261,7 +259,6 @@ async def cb_stats(callback: types.CallbackQuery, db):
         f"{rev_line}\n"
         f"📅 Today          <b>{inr(await rev_since(day))}</b>\n"
         f"🗓 Month          <b>{inr(await rev_since(month))}</b>\n\n"
-        f"💳 Payment Mode   <b>{mode}</b>\n"
         f"🔧 Maintenance    <b>{maint}</b>",
         parse_mode="HTML", reply_markup=_kb([
             [InlineKeyboardButton(text="✏️ Edit Revenue", callback_data="adm_revset"),
@@ -1335,202 +1332,6 @@ async def cb_dup_skip(callback: types.CallbackQuery, state: FSMContext):
         parse_mode="HTML")
 
 
-# ================= Payments =================
-
-@router.callback_query(F.data == "adm_payments")
-async def cb_payments(callback: types.CallbackQuery, db):
-    await callback.answer()
-    pays = await db.payments.find({"status": "pending"}).sort("created_at", -1).to_list(20)
-    if not pays:
-        await callback.message.edit_text("✅ No pending payments.",
-            reply_markup=KB.back_nav("adm_dash", "🔙 Dashboard"))
-        return
-    rows = [[InlineKeyboardButton(
-        text=f"🟡 {p.get('public_order_id','?')} — ₹{p.get('amount',0):.0f} — UTR: {p.get('utr') or '-'}",
-        callback_data=f"ver_{p.get('public_order_id')}")] for p in pays]
-    rows.append([InlineKeyboardButton(text="🔙 Dashboard", callback_data="adm_dash")])
-    await callback.message.edit_text("💳 <b>PENDING PAYMENTS</b>", parse_mode="HTML",
-                                  reply_markup=_kb(rows))
-
-
-async def _payment_detail_text(db, order_id):
-    order = await db.orders.find_one({"order_id": order_id})
-    if not order:
-        return None, None
-    pay = await db.payments.find_one({"order_id": order["_id"]})
-    user = await db.users.find_one({"_id": order["user_id"]})
-    uname = f"@{user.get('username')}" if user and user.get("username") else (user or {}).get("first_name", "?")
-    text = (
-        "🔔 <b>PAYMENT REQUEST</b>\n\n"
-        f"🆔 Order: <code>{order_id}</code>\n"
-        f"👤 {_esc(uname)} (<code>{order.get('telegram_id')}</code>)\n"
-        f"🎮 {_esc(order.get('product_name',''))} | ⏱️ {_esc(order.get('plan_name',''))}\n"
-        f"💰 ₹{order.get('amount',0):.2f}\n"
-        f"🏦 UTR: <code>{pay.get('utr') if pay else '-'}</code>\n"
-        f"📷 Screenshot: {'yes' if pay and pay.get('screenshot_file_id') else 'no'}\n"
-        f"⏳ Expires: {svc.fmt_ist(pay.get('expiry_time')) if pay and pay.get('expiry_time') else '-'}"
-    )
-    return text, pay
-
-
-async def _announce_delivery(bot, db, order, result, delivered=True):
-    """Post key-delivery audit to the verification group.
-    Manual mode: edits the original payment-request message in place.
-    Automatic mode: sends a fresh delivery message.
-    Mirrors what the user actually received - shows 'None' if undelivered."""
-    pay = await db.payments.find_one({"order_id": order["_id"]})
-    user = await db.users.find_one({"_id": order["user_id"]})
-    uname = (f"@{user.get('username')}" if user and user.get("username")
-             else (user or {}).get("first_name", "?"))
-    key_val = result["key"]["key_value"] if delivered else None
-    shown_key = _esc(key_val) if key_val else "None"
-    title = "✅ <b>KEY DELIVERED</b>" if delivered else "⚠️ <b>DELIVERY FAILED</b> (key released to stock)"
-    text = (
-        f"{title}\n\n"
-        f"🆔 Order: <code>{order['order_id']}</code>\n"
-        f"👤 Customer: {_esc(uname)} (<code>{order.get('telegram_id')}</code>)\n"
-        f"🎮 {_esc(order.get('product_name',''))} | ⏱️ {_esc(order.get('plan_name',''))}\n"
-        f"💰 ₹{order.get('amount',0):.2f}\n"
-        f"🔑 Key: <code>{shown_key}</code>\n"
-        f"🕐 {svc.fmt_ist(svc.now_utc())}"
-    )
-    # Manual mode -> edit the original alert message so the group sees
-    # request -> delivered in one place
-    if pay and pay.get("notify_chat_id") and pay.get("notify_message_id"):
-        try:
-            await bot.edit_message_text(
-                text, chat_id=pay["notify_chat_id"],
-                message_id=pay["notify_message_id"], parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
-            if (pay.get("provider") or "manual") == "automatic":
-                pass  # fall through to also send fresh below
-            else:
-                return
-        except Exception:
-            pass
-    # Fresh message path - STRICTLY the verification group
-    if Config.PAYMENT_VERIFICATION_GROUP_ID:
-        try:
-            await bot.send_message(Config.PAYMENT_VERIFICATION_GROUP_ID,
-                                   text, parse_mode="HTML")
-        except Exception:
-            pass
-
-
-@router.callback_query(F.data.regexp(r"^ver_(?!ok_|no_|cust_)"))
-async def cb_verify(callback: types.CallbackQuery, db):
-    order_id = callback.data[4:]
-    await callback.answer()
-    text, pay = await _payment_detail_text(db, order_id)
-    if not text:
-        await callback.message.edit_text("❌ Order not found.")
-        return
-    if pay and pay.get("screenshot_file_id"):
-        try:
-            await callback.message.answer_photo(
-                pay["screenshot_file_id"], caption=text, parse_mode="HTML",
-                reply_markup=KB.verify_payment(order_id))
-            return
-        except Exception:
-            pass
-    await callback.message.edit_text(text, parse_mode="HTML",
-                                  reply_markup=KB.verify_payment(order_id))
-
-
-async def _edit_alert(callback: types.CallbackQuery, text: str,
-                      reply_markup=None, parse_mode="HTML"):
-    """Edit a verification message - works for both text and media
-    (photo/document) messages, which only support edit_caption."""
-    msg = callback.message
-    is_media = any(getattr(msg, a, None) for a in
-                   ("photo", "video", "document", "animation"))
-    try:
-        if is_media:
-            await msg.edit_caption(caption=text, parse_mode=parse_mode,
-                                   reply_markup=reply_markup)
-        else:
-            await msg.edit_text(text, parse_mode=parse_mode,
-                                reply_markup=reply_markup)
-    except Exception:
-        await msg.answer(text, parse_mode=parse_mode,
-                         reply_markup=reply_markup)
-
-
-@router.callback_query(F.data.startswith("ver_ok_"))
-async def cb_verify_ok(callback: types.CallbackQuery, db):
-    order_id = callback.data[7:]
-    await callback.answer("Approving...")
-    order = await db.orders.find_one({"order_id": order_id})
-    if not order or order.get("status") != "pending":
-        await _edit_alert(callback, "⚠️ Order not pending — already processed.",
-                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
-        return
-    result = await svc.approve_payment(db, order, callback.from_user.id)
-    if result is None:
-        await _edit_alert(callback, "⚠️ Already processed.",
-                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
-        return
-    if result.get("error") == "out_of_stock":
-        await _edit_alert(callback,
-            "🔴 OUT OF STOCK — order left pending. Add keys first.",
-            reply_markup=KB.back_nav("adm_payments", "🔙 Payments"))
-        await _notify_customer_text(callback.bot, order["telegram_id"],
-            f"⚠️ Your order {order_id} is approved but we're out of stock. Support will resolve shortly.")
-        return
-
-    product = result["product"]
-    delivered = await svc.deliver_order(callback.bot, db, result["order"], product)
-    await _announce_delivery(callback.bot, db, order, result, delivered=delivered)
-    await _log(db, callback.from_user.id, "approve_payment", {"order": order_id})
-    if delivered:
-        await _edit_alert(callback,
-            f"✅ Payment approved & delivered.\nOrder: <code>{order_id}</code>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
-    else:
-        await _edit_alert(callback,
-            f"⚠️ Approved but delivery FAILED (user unreachable).\n"
-            f"Key returned to stock — order stays paid.\nOrder: <code>{order_id}</code>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
-        await _notify_customer_text(callback.bot, order["telegram_id"],
-            f"⚠️ Your order {order_id} is approved but we couldn't reach you. "
-            f"Please /start the bot so we can deliver your key.")
-
-
-@router.callback_query(F.data.startswith("ver_no_"))
-async def cb_verify_no(callback: types.CallbackQuery, db):
-    order_id = callback.data[7:]
-    await callback.answer("Rejecting...")
-    order = await db.orders.find_one({"order_id": order_id})
-    if not order or order.get("status") != "pending":
-        await _edit_alert(callback, "⚠️ Already processed.",
-                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
-        return
-    await svc.reject_payment(db, order, callback.from_user.id)
-    await _log(db, callback.from_user.id, "reject_payment", {"order": order_id})
-    await _edit_alert(callback, f"❌ Order <code>{order_id}</code> rejected.",
-                      reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
-    await _notify_customer_text(callback.bot, order["telegram_id"],
-        f"❌ Payment for order {order_id} was rejected. Contact support if this is a mistake.")
-
-
-@router.callback_query(F.data.startswith("ver_cust_"))
-async def cb_verify_cust(callback: types.CallbackQuery, db):
-    order_id = callback.data[9:]
-    await callback.answer()
-    order = await db.orders.find_one({"order_id": order_id})
-    if not order:
-        await callback.message.edit_text("❌ Not found.")
-        return
-    user = await db.users.find_one({"_id": order["user_id"]})
-    await callback.message.edit_text(
-        f"👤 <b>CUSTOMER</b>\n\n"
-        f"Name: {_esc((user or {}).get('first_name',''))} {(user or {}).get('last_name','')}\n"
-        f"Username: @{_esc((user or {}).get('username','-'))}\n"
-        f"ID: <code>{order.get('telegram_id')}</code>\n"
-        f"Joined: {svc.fmt_ist((user or {}).get('created_at', svc.now_utc()))}",
-        parse_mode="HTML")
-
-
 async def _notify_customer_text(bot, telegram_id, text):
     try:
         await bot.send_message(telegram_id, text)
@@ -1570,7 +1371,7 @@ async def cb_order_detail(callback: types.CallbackQuery, db):
         f"💰 ₹{o.get('amount',0):.2f} | Status: {o.get('status')}\n"
         f"👤 ID: <code>{o.get('telegram_id')}</code>\n"
         f"🕐 {svc.fmt_ist(o.get('created_at'))}\n"
-        f"💳 Payment: {(pay or {}).get('status','-')} | UTR: {(pay or {}).get('utr') or '-'}\n"
+        f"💳 Payment: {(pay or {}).get('status','-')}\n"
         f"🔑 Key: <code>{_esc(o.get('key_value') or '-')}</code>",
         parse_mode="HTML",
         reply_markup=_kb([
@@ -1617,7 +1418,7 @@ async def st_search_orders(m, state, db):
         f"🎮 {_esc(order.get('product_name',''))} | {_esc(order.get('plan_name',''))}\n"
         f"💰 ₹{order.get('amount',0):.2f} | {order.get('status')}\n"
         f"👤 <code>{order.get('telegram_id')}</code> | 🕐 {svc.fmt_ist(order.get('created_at'))}\n"
-        f"💳 {(pay or {}).get('status','-')} | UTR: {(pay or {}).get('utr') or '-'}",
+        f"💳 {(pay or {}).get('status','-')}",
         parse_mode="HTML", reply_markup=KB.back_nav("adm_orders", "🔙 Orders"))
 
 
@@ -2096,9 +1897,6 @@ SETTING_LABELS = {
     "channel": ("official_channel", "📢 Official Channel (@name or link)"),
     "setup": ("setup_channel", "🎁 Setup Channel (@name or link)"),
     "support": ("support_username", "📞 Support Username (@name)"),
-    "upi": ("upi_id", "🏦 UPI ID"),
-    "payee": ("payee_name", "👤 Payee Name"),
-    "instructions": ("payment_instructions", "📋 Payment Instructions"),
     "maint": ("maintenance_message", "🔧 Maintenance Message"),
     "howto": ("how_to_text", "🔴 How to Buy Text"),
 }
@@ -2106,8 +1904,7 @@ SETTING_LABELS = {
 
 async def _settings_kb(db):
     s = await svc.get_settings(db)
-    return KB.settings_menu(bool(s.get("maintenance_mode")),
-                            s.get("payment_mode", "manual"))
+    return KB.settings_menu(bool(s.get("maintenance_mode")))
 
 
 @router.callback_query(F.data == "adm_settings")
@@ -2141,56 +1938,6 @@ async def st_edit_setting(m, state, db):
     await _log(db, m.from_user.id, "edit_setting", {"key": data["key"]})
     await state.clear()
     await m.answer("✅ Setting saved.", reply_markup=KB.back_nav("adm_settings", "🔙 Settings"))
-
-
-@router.callback_query(F.data == "adm_paymode")
-async def cb_paymode_legacy(callback: types.CallbackQuery, db):
-    # old single-button keyboards (pre-restart) still carry this callback
-    s = await svc.get_settings(db)
-    new = "automatic" if s.get("payment_mode", "manual") == "manual" else "manual"
-    await db.settings.update_one({"key": "payment_mode"},
-        {"$set": {"key": "payment_mode", "value": new, "updated_at": svc.now_utc()}}, upsert=True)
-    svc.invalidate_settings()
-    await _log(db, callback.from_user.id, "payment_mode", {"mode": new})
-    await callback.answer(f"Payment mode → {new}")
-    await callback.message.edit_text(
-        "⚙️ <b>BOT SETTINGS</b>", parse_mode="HTML",
-        reply_markup=await _settings_kb(db))
-
-
-@router.callback_query(F.data.startswith("adm_paymode_"))
-async def cb_paymode(callback: types.CallbackQuery, db):
-    new = callback.data.rsplit("_", 1)[-1]
-    if new == "auto":
-        new = "automatic"
-    if new not in ("manual", "automatic"):
-        await callback.answer("Unknown", show_alert=True)
-        return
-    s = await svc.get_settings(db)
-    cur = s.get("payment_mode", "manual")
-    if cur == new:
-        await callback.answer(f"Already {new}")
-        return
-    await db.settings.update_one({"key": "payment_mode"},
-        {"$set": {"key": "payment_mode", "value": new, "updated_at": svc.now_utc()}}, upsert=True)
-    svc.invalidate_settings()
-    await _log(db, callback.from_user.id, "payment_mode", {"mode": new})
-    warn = ""
-    if new == "automatic":
-        from bot import payverify
-        if not payverify.PayVerifyConfig.from_env().configured:
-            warn = ("\n\n⚠️ Gmail IMAP not configured — add IMAP_USERNAME, "
-                    "IMAP_APP_PASSWORD and DEFAULT_UPI_ID to .env")
-    await callback.answer(
-        "Auto-verify ON — Gmail IMAP not configured" if warn
-        else f"Payment mode → {new}",
-        show_alert=bool(warn))
-    await callback.message.edit_text(
-        "⚙️ <b>BOT SETTINGS</b>" + warn,
-        parse_mode="HTML", reply_markup=await _settings_kb(db))
-
-
-# (payment_notify_target toggle removed - alerts go strictly to the group)
 
 
 @router.callback_query(F.data == "adm_maintoggle")

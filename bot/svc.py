@@ -9,7 +9,6 @@ from typing import Optional, Dict, Any
 
 from bot.db import Database
 from bot.oid import ObjectId
-from config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +46,6 @@ async def get_settings(db) -> Dict[str, Any]:
     return data
 
 
-async def get_payment_mode(db) -> str:
-    s = await get_settings(db)
-    return (s.get("payment_mode") or "manual").lower()
-
-
 async def next_order_id(db) -> str:
     doc = await db.counters.find_one_and_update(
         {"_id": "order"},
@@ -61,10 +55,10 @@ async def next_order_id(db) -> str:
     return f"KS{doc['seq']:06d}"
 
 
-async def create_order(user: Dict, product: Dict, plan: Dict, db) -> Dict:
+async def create_order(user: Dict, product: Dict, plan: Dict, db,
+                       expires_at: datetime) -> Dict:
     order_id = await next_order_id(db)
-    validity = int(Config.PAYMENT_VALIDITY_MINUTES)
-    expiry = now_utc() + timedelta(minutes=validity)
+    expiry = expires_at
 
     order = {
         "order_id": order_id,
@@ -84,9 +78,6 @@ async def create_order(user: Dict, product: Dict, plan: Dict, db) -> Dict:
     order_oid = ObjectId()
     order["_id"] = order_oid
 
-    # NOTE: do NOT include utr/screenshot keys here - the legacy unique sparse
-    # index on payments.utr treats null as a value and would collide.
-    s = await get_settings(db)
     payment = {
         "order_id": order_oid,
         "public_order_id": order_id,
@@ -95,7 +86,7 @@ async def create_order(user: Dict, product: Dict, plan: Dict, db) -> Dict:
         "amount": float(plan["price"]),
         "status": "pending",
         "expiry_time": expiry,
-        "provider": s.get("payment_mode", "manual") or "manual",
+        "provider": "automatic",
         "created_at": now_utc(),
         "updated_at": now_utc(),
     }
@@ -123,15 +114,6 @@ async def cancel_user_pending_orders(db, telegram_id: int):
         )
 
 
-async def submit_payment_details(db, payment_oid, utr=None, screenshot_file_id=None):
-    upd = {"updated_at": now_utc()}
-    if utr:
-        upd["utr"] = utr
-    if screenshot_file_id:
-        upd["screenshot_file_id"] = screenshot_file_id
-    await db.payments.update_one({"_id": payment_oid}, {"$set": upd})
-
-
 async def stock_for_plan(db, plan_id) -> int:
     return await db.keys.count_documents({"plan_id": plan_id, "status": "available"})
 
@@ -144,8 +126,8 @@ async def allocate_key(db, plan_id) -> Optional[Dict]:
     )
 
 
-async def approve_payment(db, order: Dict, admin_telegram_id: int) -> Optional[Dict]:
-    """Idempotent approval. Returns payload dict, {'error':...}, or None if ineligible."""
+async def mark_order_paid(db, order: Dict, verified_by: int) -> Optional[Dict]:
+    """Idempotent payment settlement. Returns payload dict, {'error':...}, or None if ineligible."""
     res = await db.orders.update_one(
         {"_id": order["_id"], "status": "pending"},
         {"$set": {"status": "paid", "updated_at": now_utc(), "paid_at": now_utc()}},
@@ -173,7 +155,7 @@ async def approve_payment(db, order: Dict, admin_telegram_id: int) -> Optional[D
     await db.payments.update_many(
         {"order_id": order["_id"]},
         {"$set": {"status": "approved", "updated_at": now_utc(),
-                  "approved_by": admin_telegram_id}},
+                  "approved_by": verified_by}},
     )
 
     # keep the in-memory order in sync so delivery shows the key
@@ -192,18 +174,6 @@ async def approve_payment(db, order: Dict, admin_telegram_id: int) -> Optional[D
     return {"key": key, "product": product, "order": order}
 
 
-async def reject_payment(db, order: Dict, admin_telegram_id: int):
-    await db.orders.update_one(
-        {"_id": order["_id"]},
-        {"$set": {"status": "rejected", "updated_at": now_utc()}},
-    )
-    await db.payments.update_many(
-        {"order_id": order["_id"]},
-        {"$set": {"status": "rejected", "updated_at": now_utc(),
-                  "rejected_by": admin_telegram_id}},
-    )
-
-
 async def expire_due_payments(db):
     """Expire pending payments past expiry_time. Returns list of expired docs."""
     now = now_utc()
@@ -213,9 +183,7 @@ async def expire_due_payments(db):
         await db.payments.update_one(
             {"_id": pay["_id"]},
             {"$set": {"status": "expired", "updated_at": now,
-                      "expiry_notified": True},
-             # Release the UTR from the unique index so it can be reused
-             "$unset": {"utr": ""}},
+                      "expiry_notified": True}},
         )
         if pay.get("public_order_id"):
             await db.orders.update_one(

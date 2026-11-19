@@ -94,7 +94,7 @@ async def _payverify_cycle(bot: Bot, db, cfg):
     from bot import payverify
     now = svc.now_utc()
 
-    # verify window passed -> mark expired (order stays pending for manual UTR)
+    # verify window passed -> mark expired; the payment job expires the order
     stale = await db.orders.find(
         {"verify_status": "pending", "verify_expires_at": {"$lt": now}}
     ).to_list(50)
@@ -134,7 +134,7 @@ async def _payverify_cycle(bot: Bot, db, cfg):
         msg = matches.get(str(o["_id"]))
         if not msg:
             continue
-        # re-check: order may have been approved/rejected since the fetch
+        # re-check: order may have been settled/cancelled since the fetch
         fresh = await db.orders.find_one({"_id": o["_id"], "status": "pending"})
         if not fresh:
             await db.orders.update_one(
@@ -160,10 +160,10 @@ async def _payverify_cycle(bot: Bot, db, cfg):
                       "verify_matched_at": now,
                       "updated_at": now}})
 
-        # same approval path as manual admin approval (svc + deliver + audit)
-        result = await svc.approve_payment(db, fresh, admin_id)
+        # shared settlement path: mark paid, allocate key, deliver, audit
+        result = await svc.mark_order_paid(db, fresh, admin_id)
         if result is None:
-            continue  # lost a race with manual approve/reject
+            continue  # lost a race with another settlement/expiry
         if result.get("error") == "out_of_stock":
             # keep verify_status pending so a later cycle retries once
             # stock is replenished; warn the group only once
@@ -242,7 +242,7 @@ async def _payverify_cycle(bot: Bot, db, cfg):
 
 async def payment_verify_job(bot: Bot):
     """Poll Gmail for FamApp/bank credit alerts and auto-approve matching
-    orders. No-op unless payment_mode=automatic AND IMAP is configured."""
+    orders. No-op unless Gmail IMAP is configured."""
     from bot import payverify
     while True:
         interval = 30
@@ -250,8 +250,7 @@ async def payment_verify_job(bot: Bot):
             db = Database.get_db()
             cfg = payverify.PayVerifyConfig.from_env()
             interval = max(10, cfg.poll_interval_seconds)
-            mode = await svc.get_payment_mode(db)
-            if mode == "automatic" and cfg.configured:
+            if cfg.configured:
                 await _payverify_cycle(bot, db, cfg)
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
@@ -272,10 +271,6 @@ async def main():
         "welcome_message": None,  # None => handler uses built-in default
         "official_channel": Config.OFFICIAL_CHANNEL,
         "support_username": Config.SUPPORT_USERNAME,
-        "upi_id": Config.UPI_ID,
-        "payee_name": Config.PAYEE_NAME,
-        "payment_instructions": Config.PAYMENT_INSTRUCTIONS,
-        "payment_mode": Config.PAYMENT_MODE,
         "maintenance_mode": False,
         "maintenance_message": "🔧 Bot is under maintenance. Please try later.",
         "reseller_enabled": Config.RESELLER_SYSTEM_ENABLED,

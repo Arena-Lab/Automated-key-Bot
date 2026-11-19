@@ -1,207 +1,124 @@
-# Premium Telegram Digital Key Shop Bot
+# Telegram Digital Key Shop Bot
 
-A production-grade Telegram bot for selling digital keys with UPI payments, key inventory management, automated delivery, and a complete admin panel.
+A Telegram bot for selling digital keys with automatic UPI payment detection via Gmail/IMAP, key inventory management, automated delivery, reseller wallets, and a Telegram admin panel.
 
 ## Features
 
-### Customer Features
-- 🛍️ Browse products with images and descriptions
-- ⏱️ Multiple subscription plans per product (custom durations & prices)
-- 💳 UPI QR code payment with order tracking
-- 🔢 UTR submission + payment screenshot upload
-- 🔑 Automatic key delivery after payment approval
-- 📱 APK file, setup video & instructions delivered automatically
-- 📦 Order history and My Keys section
-- 📥 Re-download previously purchased files
+### Customer
+- Browse products and subscription plans
+- Per-order UPI QR with exact amount and unique payment reference
+- Automatic payment detection from Gmail/IMAP credit alerts
+- Automatic key, APK/video, instructions, and link delivery after verified payment
+- Order history, key lookup, file resend, and pending-payment cancellation
+- Optional reseller program with USDT wallet and redeem codes
 
-### Admin Features
-- ⚜️ Full admin dashboard via Telegram
-- 📊 Statistics (users, orders, revenue, inventory)
-- 🛍️ Product CRUD with images, APK, videos, instructions
-- ⏱️ Plan management (name, duration, price, enable/disable)
-- 🔑 Key inventory: single add, bulk add, TXT/CSV file upload
-- 💰 Payment management: switch manual/automatic mode, update UPI/QR
-- ✅ Payment approval/rejection with admin verification group
-- 📢 Broadcast text/photo/video/document to all users
-- 👥 Customer management (view, block/unblock)
-- 🔧 Maintenance mode toggle
-- 📝 All shop settings editable from panel (no code changes)
-- 📋 Admin activity logging
+### Admin
+- Dashboard for products, plans, keys, orders, customers, files, broadcasts, promos, and settings
+- Product/plan/key management
+- APK, setup video, product links, and how-to-buy video management
+- Broadcast and promo messages
+- Customer lookup and blocking
+- Reseller approvals, wallet adjustments, redeem codes, and pricing
+- Automatic payment audit messages in the configured Telegram group
 
-### Architecture
-- **Python 3.10+** with **Aiogram 3.x**
-- **MongoDB** with Motor (async driver)
-- Modular structure: handlers, services, repositories, payments, inventory
-- FSM-based multi-step flows
-- Idempotent payment approval & key allocation
-- Payment provider snapshots per order
+## Payment Flow
 
-## Project Structure
+1. Customer chooses a product and plan.
+2. Bot creates a pending order and sends a QR for the exact INR amount.
+3. The QR/UPI URI contains a unique purpose note (for example `KS-20261113-AB12CD`).
+4. `bot/payverify.py` polls the configured Gmail inbox over IMAP.
+5. Incoming FamApp/bank credit alerts are matched by purpose + amount, with an amount-only fallback window.
+6. Matching orders are approved atomically, keys are allocated, and delivery is sent automatically.
+7. Duplicate Gmail messages are deduplicated through `payverify_logs`.
 
-```
-├── main.py                  # Entry point
-├── config.py                # Configuration from env vars
-├── seed.py                  # Optional demo data seeder
-├── requirements.txt
-├── .env.example
-├── ARCHITECTURE.md          # Detailed architecture & DB schema
-└── bot/
-    ├── handlers/            # customer.py, admin.py, admin_products.py,
-    │                        # admin_keys.py, admin_extra.py
-    ├── keyboards/           # Inline keyboard builders
-    ├── middlewares/         # Auth & maintenance middleware
-    ├── filters/             # Admin/user authorization filters
-    ├── services/            # Business logic (user, product, order, payment)
-    ├── payments/            # Payment providers (manual UPI, auto gateway stub)
-    ├── inventory/           # Key manager & atomic allocator
-    ├── delivery/            # Delivery sender & message formatter
-    ├── database/            # connection.py, models.py, repositories.py
-    ├── states/              # FSM states
-    └── utils/               # Validators & helpers
-```
+There is no manual UTR/screenshot submission or admin payment approval step.
+
+## Requirements
+
+- Python 3.10+
+- Telegram bot token from @BotFather
+- Gmail account that receives UPI payment alerts
+- Gmail App Password with IMAP access
 
 ## Setup
 
-### 1. Install Dependencies
-
 ```bash
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
 venv\Scripts\activate     # Windows
+# source venv/bin/activate  # Linux/macOS
 pip install -r requirements.txt
-```
-
-### 2. Configure Environment
-
-```bash
-cp .env.example .env
+copy .env.example .env     # Windows
+# cp .env.example .env     # Linux/macOS
 ```
 
 Edit `.env`:
 
 ```env
 BOT_TOKEN=your_telegram_bot_token
-ADMIN_IDS=your_telegram_user_id
-DATABASE_URL=mongodb://localhost:27017
-DATABASE_NAME=key_shop_bot
-UPI_ID=yourname@upi
-PAYEE_NAME=Your Shop Name
-PAYMENT_VERIFICATION_GROUP_ID=-1001234567890  # optional admin group
-SHOP_NAME=My Key Shop
-OFFICIAL_CHANNEL=@your_channel
-SUPPORT_USERNAME=@your_support
+ADMIN_IDS=your_numeric_telegram_id
+
+IMAP_USERNAME=your@gmail.com
+IMAP_APP_PASSWORD=your_gmail_app_password
+DEFAULT_UPI_ID=yourname@upi
+PAYEE_NAME=Your Business Name
+PAYMENT_VERIFICATION_GROUP_ID=-1001234567890
 ```
 
-**Get your Telegram user ID:** message [@userinfobot](https://t.me/userinfobot) on Telegram.
+Required for automatic verification:
 
-### 3. Start MongoDB
+- `IMAP_USERNAME`
+- `IMAP_APP_PASSWORD`
+- `DEFAULT_UPI_ID`
+
+Optional tuning:
+
+- `IMAP_HOST`, `IMAP_PORT`, `IMAP_MAILBOX`, `IMAP_SENDER_FILTER`
+- `PURPOSE_PREFIX`
+- `PAYMENT_EXPIRY_MINUTES`
+- `PAYVERIFY_POLL_SECONDS`
+- `GMAIL_LOOKBACK_HOURS`
+
+Start the bot:
 
 ```bash
-# Local MongoDB must be running, or use MongoDB Atlas:
-DATABASE_URL=mongodb+srv://user:pass@cluster.mongodb.net/
-```
-
-### 4. Run
-
-```bash
-# Optional: seed demo product
-python seed.py
-
-# Start bot
 python main.py
 ```
 
-## First-Time Setup Flow
+The bot uses SQLite (`data/store.db`) through the compatibility layer in `bot/store.py`. Existing JSON-style documents are preserved; no destructive migration is performed.
 
-1. Start the bot → `/start`
-2. As admin: `/admin` → Manage Products → Add Product
-3. Edit the product → Manage Plans → Add Plan(s)
-4. Manage Keys → Add Single Key / Bulk Add / Upload File
-   - Format: `product_id plan_id key_value` (IDs shown in plans view)
-5. Payment Management → Update UPI Details / QR Code
-6. Customers can now purchase!
+## Admin
 
-## Payment Verification
+- `/admin` — main control panel
+- `/settings` — shop settings and maintenance controls
+- `/adminhelp` — admin command reference
+- `/blockuser USER_ID`, `/unblockuser USER_ID`, `/blockedusers` — user moderation
 
-### Manual Mode (default)
-1. Customer pays via UPI and submits UTR (+ optional screenshot)
-2. Request forwarded to `PAYMENT_VERIFICATION_GROUP_ID` (or admins)
-3. Admin clicks ✅ Approve → key allocated & delivered automatically
-4. Admin clicks ❌ Reject → customer notified
+Payment verification is automatic. Admins can monitor orders and payment status under **Orders**, and audit messages are sent to `PAYMENT_VERIFICATION_GROUP_ID` when configured.
 
-### Automatic Mode
-Architecture is ready in `bot/payments/automatic.py` — implement a real
-gateway (Razorpay/PhonePe) by extending `BasePaymentProvider` and adding
-webhook handling. Payment mode can be switched from the admin panel without
-code changes.
+## Project Structure
 
-## Admin Commands
-
-| Command | Description |
-|---------|-------------|
-| `/admin` | Open admin panel |
-| `/stats` | Quick statistics |
-| `/payment` | Payment management |
-| `/addkeys` | Key management menu |
-| `/inventory` | View inventory status |
-| `/orders` | Order management |
-| `/users` | List recent users |
-| `/user <id>` | User details |
-| `/block <id>` `/unblock <id>` | Block/unblock user |
-| `/broadcast` | Send broadcast |
-| `/searchkeys <term>` | Search keys |
-| `/maintenance` | Toggle maintenance mode |
-| `/help` | Admin help |
-
-## Deployment (Linux VPS)
-
-```bash
-# Install Python 3.10+, MongoDB (or use Atlas)
-git clone <repo> && cd automated-key-bot
-python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env  # edit with real values
-
-# Run with systemd or screen/tmux
-python main.py
-```
-
-Example systemd unit:
-
-```ini
-[Unit]
-Description=Telegram Key Shop Bot
-After=network.target
-
-[Service]
-User=ubuntu
-WorkingDirectory=/home/ubuntu/automated-key-bot
-ExecStart=/home/ubuntu/automated-key-bot/venv/bin/python main.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
+```text
+main.py                  # Entry point and background jobs
+config.py                # Environment configuration
+bot/
+  payverify.py           # Gmail/IMAP automatic payment matcher
+  svc.py                 # Orders, payments, inventory, delivery services
+  store.py               # SQLite-backed document store
+  ui.py                  # Inline/reply keyboards
+  fsm.py                 # Admin/reseller FSM states
+  handlers/
+    customer.py          # Customer purchase and order flows
+    admin.py             # Admin panel
+    reseller.py          # Reseller router aggregation
+    reseller_shop.py     # Reseller customer panel
+    reseller_admin.py    # Reseller admin panel
+  rsvc.py                # Reseller wallet/code/pricing services
 ```
 
 ## Security Notes
 
-- Admin actions restricted to `ADMIN_IDS` via router-level filters
-- Payment approval requires pending status (idempotent — safe against double-clicks)
-- Keys allocated atomically; never delivered twice
-- UTR uniqueness enforced at database level
-- Secrets only in `.env` (never commit it)
-- All admin actions logged to `admin_logs` collection
-
-## Testing Checklist
-
-- [ ] `/start` shows welcome + menu
-- [ ] Add product → add plans → add keys via admin panel
-- [ ] Purchase flow: product → plan → payment screen
-- [ ] Submit UTR → appears in verification group
-- [ ] Approve → customer receives key + files
-- [ ] Double-approve doesn't duplicate delivery
-- [ ] Reject → customer notified
-- [ ] My Keys / My Orders show correct data
-- [ ] Maintenance mode blocks customers only
-- [ ] Broadcast reaches all non-blocked users
+- Admin actions are restricted to `ADMIN_IDS`
+- Key allocation is atomic and orders are approved idempotently
+- Gmail message IDs are deduplicated to prevent repeat delivery
+- Secrets belong only in `.env` (never commit it)
+- Backups are written under `backups/automatic/`

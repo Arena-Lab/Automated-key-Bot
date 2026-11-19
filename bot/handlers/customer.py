@@ -12,9 +12,7 @@ from aiogram.types import (InlineKeyboardMarkup, InlineKeyboardButton,
                            BufferedInputFile)
 from bot.oid import ObjectId
 
-from bot.db import Database
 from bot.ui import KB
-from bot.fsm import CustomerStates
 import bot.svc as svc
 from bot import payverify
 from config import Config
@@ -194,8 +192,7 @@ async def rb_howto(message: types.Message, state: FSMContext, db):
         "2️⃣ Select a product\n"
         "3️⃣ Choose a validity plan\n"
         "4️⃣ Pay via UPI (scan QR)\n"
-        "5️⃣ Submit UTR + screenshot\n"
-        "6️⃣ Receive your key + files instantly!"
+        "5️⃣ Receive your key automatically once payment is detected!"
     )
     if tut and tut.get("file_id") and tut.get("enabled", True):
         await message.answer_video(
@@ -307,6 +304,9 @@ async def cb_plan(callback: types.CallbackQuery, user: dict, state: FSMContext, 
     # ONE purchase action = ONE order. The per-user lock serializes rapid
     # clicks; a pending order for the SAME plan is reused (fresh payment
     # message, same order/QR reference) instead of duplicated.
+    pv_cfg = payverify.PayVerifyConfig.from_env()
+    fallback_expiry = svc.now_utc() + timedelta(
+        minutes=pv_cfg.order_expiry_minutes)
     lock = await _purchase_lock(user["telegram_id"])
     async with lock:
         existing = await db.orders.find_one({
@@ -339,82 +339,54 @@ async def cb_plan(callback: types.CallbackQuery, user: dict, state: FSMContext, 
                     except Exception:
                         pass
             await svc.cancel_user_pending_orders(db, user["telegram_id"])
-            order = await svc.create_order(user, product, plan, db)
+            order = await svc.create_order(
+                user, product, plan, db, expires_at=fallback_expiry)
 
-    s = await svc.get_settings(db)
-    upi = s.get("upi_id") or Config.UPI_ID
-    payee = s.get("payee_name") or Config.PAYEE_NAME or "Key Shop"
-    instr = s.get("payment_instructions") or Config.PAYMENT_INSTRUCTIONS
     amount = order["amount"]
-    expiry = order["payment"]["expiry_time"]
-
-    # Automatic mode: unique purpose note + per-order UPI URI for Gmail
-    # payment-alert matching (bot/payverify.py poller approves on match).
-    # A reused order keeps its existing purpose/URI so the Gmail match still works.
-    pv_cfg = payverify.PayVerifyConfig.from_env()
-    auto_verify = (await svc.get_payment_mode(db) == "automatic")
-    purpose = order.get("verify_purpose") if auto_verify else None
-    verify_expires = order.get("verify_expires_at") if purpose else None
-    if auto_verify and not purpose:
-        purpose = payverify.generate_purpose(pv_cfg.purpose_prefix)
-        verify_expires = svc.now_utc() + timedelta(
-            minutes=pv_cfg.order_expiry_minutes)
-    # dynamic per-order UPI URI for BOTH modes - QR carries exact amount
-    # plus a note (purpose in auto mode, order id in manual mode)
-    upi_id = pv_cfg.default_upi_id or upi
-    payee_name = pv_cfg.payee_name or payee
-    upi_uri = order.get("upi_uri") or payverify.build_upi_uri(
-        upi_id, payee_name,
-        payverify.parse_amount(amount), purpose or order["order_id"])
-    if auto_verify and not order.get("verify_purpose"):
-        await db.orders.update_one(
-            {"_id": order["_id"]},
-            {"$set": {
-                "verify_purpose": purpose,
-                "verify_created_at": svc.now_utc(),
-                "verify_expires_at": verify_expires,
-                "verify_status": "pending",
-                "upi_uri": upi_uri,
-                "updated_at": svc.now_utc(),
-            }})
-        # keep the order payable for the whole verify window
-        await db.payments.update_one(
-            {"public_order_id": order["order_id"]},
-            {"$set": {"expiry_time": verify_expires,
-                      "updated_at": svc.now_utc()}})
-    if auto_verify and verify_expires:
-        expiry = verify_expires
-
-    pay_kb = KB.payment_auto(order["order_id"]) if purpose \
-        else KB.payment(order["order_id"])
-
+    upi_id = pv_cfg.default_upi_id
+    purpose = order.get("verify_purpose")
+    verify_expires = order.get("verify_expires_at")
     if purpose:
-        # compact auto-verify payment message
-        try:
-            mins = max(1, int((expiry - svc.now_utc()).total_seconds() // 60))
-        except Exception:
-            mins = pv_cfg.order_expiry_minutes
-        caption = (
-            f"🎮 <b>Game:</b> {_esc(product['name'])}\n"
-            f"⏱️ <b>Plan:</b> {_esc(plan['name'])}\n\n"
-            f"💸 <b>Scan & Pay Exactly:</b> ₹{float(amount):.2f}\n\n"
-            f"🆔 <b>Order ID:</b> <code>{order['order_id']}</code>\n"
-            f"⏰ <b>Valid for {mins} minutes</b>\n\n"
-            "Your key is sent automatically once payment is detected."
-        )
+        verify_expires = verify_expires or fallback_expiry
+        upi_uri = order.get("upi_uri") or payverify.build_upi_uri(
+            upi_id, pv_cfg.payee_name,
+            payverify.parse_amount(amount), purpose)
     else:
-        caption = (
-            "💳 <b>PAYMENT DETAILS</b>\n\n"
-            f"🎮 {_esc(product['name'])}\n⏱️ {_esc(plan['name'])}\n\n"
-            f"💰 Amount: <b>₹{amount:g}</b>\n"
-            f"🆔 Order ID: <code>{order['order_id']}</code>\n\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            f"🏦 UPI ID: <code>{_esc(upi)}</code>\n"
-            f"👤 Payee: {_esc(payee)}\n\n"
-            f"📌 <b>Instructions:</b>\n{_esc(instr)}\n\n"
-            f"⏳ Expires: {svc.fmt_ist(expiry)}\n"
-            "Order auto-cancels if unpaid."
-        )
+        purpose = payverify.generate_purpose(pv_cfg.purpose_prefix)
+        verify_expires = fallback_expiry
+        upi_uri = payverify.build_upi_uri(
+            upi_id, pv_cfg.payee_name,
+            payverify.parse_amount(amount), purpose)
+
+    await db.orders.update_one(
+        {"_id": order["_id"]},
+        {"$set": {
+            "verify_purpose": purpose,
+            "verify_created_at": order.get("verify_created_at") or svc.now_utc(),
+            "verify_expires_at": verify_expires,
+            "verify_status": "pending",
+            "upi_uri": upi_uri,
+            "updated_at": svc.now_utc(),
+        }})
+    await db.payments.update_one(
+        {"public_order_id": order["order_id"]},
+        {"$set": {"expiry_time": verify_expires,
+                  "updated_at": svc.now_utc()}})
+
+    expiry = verify_expires
+    try:
+        mins = max(1, int((expiry - svc.now_utc()).total_seconds() // 60))
+    except Exception:
+        mins = pv_cfg.order_expiry_minutes
+    caption = (
+        f"🎮 <b>Game:</b> {_esc(product['name'])}\n"
+        f"⏱️ <b>Plan:</b> {_esc(plan['name'])}\n\n"
+        f"💸 <b>Scan & Pay Exactly:</b> ₹{float(amount):.2f}\n\n"
+        f"🆔 <b>Order ID:</b> <code>{order['order_id']}</code>\n"
+        f"⏰ <b>Valid for {mins} minutes</b>\n\n"
+        "Your key is sent automatically once payment is detected."
+    )
+    pay_kb = KB.payment(order["order_id"])
 
     # QR code: single send attempt - generated per-order UPI QR. On ANY
     # failure send text-only payment info; never chain photo fallbacks
@@ -458,130 +430,7 @@ async def cb_plan(callback: types.CallbackQuery, user: dict, state: FSMContext, 
                       "payment_chat_id": sent.chat.id}})
 
 
-# ---------------- Payment submission ----------------
-
-async def _get_pending_order(db, order_id, telegram_id):
-    order = await db.orders.find_one({"order_id": order_id})
-    if not order or order.get("telegram_id") != telegram_id or order.get("status") != "pending":
-        return None
-    return order
-
-
-@router.callback_query(F.data.startswith("pay_utr_"))
-async def cb_pay_utr(callback: types.CallbackQuery, state: FSMContext, db):
-    order_id = callback.data.split("_", 2)[2]
-    await callback.answer()
-    pay = await db.payments.find_one({"public_order_id": order_id})
-    if pay and (pay.get("utr") or pay.get("screenshot_file_id")):
-        await callback.message.answer(
-            "ℹ️ Payment details already submitted for this order.\n\n"
-            "Please wait for verification.",
-            parse_mode="HTML", reply_markup=KB.reply_menu())
-        return
-    await state.set_state(CustomerStates.waiting_for_utr)
-    await state.update_data(order_id=order_id)
-    await callback.message.answer(
-        f"🧾 Submit UTR for order <code>{order_id}</code>\n\n"
-        "Send the UTR / transaction ID (numbers only):",
-        parse_mode="HTML",
-    )
-
-
-@router.message(CustomerStates.waiting_for_utr, F.text)
-async def msg_utr(message: types.Message, state: FSMContext, user: dict, db):
-    data = await state.get_data()
-    order_id = data.get("order_id")
-    utr = (message.text or "").strip()
-
-    if utr.startswith("/") or utr in ("🛍️ Purchase Keys", "🤑 Purchase Keys", "🔑 My Keys", "🪙 My Keys",
-                                      "🎁 Setup Channel", "📞 Owner Contact", "🔴 How to Buy?", "👑 Resellers"):
-        await state.clear()
-        await message.answer("Payment session ended.", reply_markup=KB.reply_menu())
-        return
-
-    if not utr.isdigit() or len(utr) < 8:
-        await message.answer("❌ Invalid UTR. Send numbers only (min 8 digits).")
-        return
-
-    order = await _get_pending_order(db, order_id, user["telegram_id"])
-    if not order:
-        await state.clear()
-        await message.answer("❌ Order expired or already processed.", reply_markup=KB.reply_menu())
-        return
-
-    # Duplicate UTR check - payments.utr has a unique index, so ANY existing
-    # doc with this UTR will collide. Only expired payments may release it.
-    existing_utr = await db.payments.find_one({"utr": utr})
-    if existing_utr:
-        if existing_utr.get("status") != "expired":
-            await message.answer("❌ This UTR was already submitted for another order.")
-            return
-        # Free the UTR from the expired payment so it can be reused
-        await db.payments.update_one(
-            {"_id": existing_utr["_id"]},
-            {"$unset": {"utr": ""}}
-        )
-
-    pay = await db.payments.find_one({"public_order_id": order_id})
-    if pay:
-        await svc.submit_payment_details(db, pay["_id"], utr=utr)
-
-    await state.clear()
-    await message.answer(
-        f"✅ UTR <code>{utr}</code> submitted for order <code>{order_id}</code>.\n\n"
-        "⏳ Please wait — your payment is under verification. "
-        "You will receive your key once approved.",
-        parse_mode="HTML",
-        reply_markup=KB.reply_menu(),
-    )
-    await _notify_admins_payment(db, message.bot, order_id, utr, None)
-
-
-@router.callback_query(F.data.startswith("pay_ss_"))
-async def cb_pay_ss(callback: types.CallbackQuery, state: FSMContext, db):
-    order_id = callback.data.split("_", 2)[2]
-    await callback.answer()
-    pay = await db.payments.find_one({"public_order_id": order_id})
-    if pay and (pay.get("utr") or pay.get("screenshot_file_id")):
-        await callback.message.answer(
-            "ℹ️ Payment details already submitted for this order.\n\n"
-            "Please wait for verification.",
-            parse_mode="HTML", reply_markup=KB.reply_menu())
-        return
-    await state.set_state(CustomerStates.waiting_for_screenshot)
-    await state.update_data(order_id=order_id)
-    await callback.message.answer(
-        f"📸 Send the payment screenshot for order <code>{order_id}</code>:",
-        parse_mode="HTML",
-    )
-
-
-@router.message(CustomerStates.waiting_for_screenshot, F.photo)
-async def msg_screenshot(message: types.Message, state: FSMContext, user: dict, db):
-    data = await state.get_data()
-    order_id = data.get("order_id")
-    file_id = message.photo[-1].file_id
-    order = await _get_pending_order(db, order_id, user["telegram_id"])
-    if not order:
-        await state.clear()
-        await message.answer("❌ Order expired.", reply_markup=KB.reply_menu())
-        return
-    pay = await db.payments.find_one({"public_order_id": order_id})
-    if pay:
-        await svc.submit_payment_details(db, pay["_id"], screenshot_file_id=file_id)
-    await state.clear()
-    await message.answer(
-        "✅ Screenshot received.\n\n⏳ Please wait — your payment is under verification. "
-        "You will receive your key once approved.",
-        reply_markup=KB.reply_menu())
-    await _notify_admins_payment(db, message.bot, order_id, None, file_id)
-
-
-@router.message(CustomerStates.waiting_for_screenshot, F.text)
-async def msg_ss_text(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Payment session ended.", reply_markup=KB.reply_menu())
-
+# ---------------- Payment cancellation ----------------
 
 @router.callback_query(F.data.startswith("pay_cancel_"))
 async def cb_pay_cancel(callback: types.CallbackQuery, user: dict, state: FSMContext, db):
@@ -600,92 +449,6 @@ async def cb_pay_cancel(callback: types.CallbackQuery, user: dict, state: FSMCon
     await callback.bot.send_message(user["telegram_id"],
         f"❌ Payment for order {order_id} cancelled.", reply_markup=KB.reply_menu())
     await callback.answer()
-
-
-async def _payment_destinations(db):
-    """Payment alerts go STRICTLY to the verification group from .env."""
-    group_id = Config.PAYMENT_VERIFICATION_GROUP_ID
-    return ([group_id] if group_id else []), []
-
-
-async def _send_alert(bot, tid, text, reply_markup=None, screenshot_file_id=None):
-    """Send one payment alert; returns {"chat_id","message_id"} on success."""
-    try:
-        if screenshot_file_id:
-            msg = await bot.send_photo(tid, screenshot_file_id,
-                                       caption=text, parse_mode="HTML",
-                                       reply_markup=reply_markup)
-        else:
-            msg = await bot.send_message(tid, text, parse_mode="HTML",
-                                         reply_markup=reply_markup)
-        return {"chat_id": tid, "message_id": msg.message_id}
-    except Exception:
-        try:
-            msg = await bot.send_message(tid, text + "\n\n📷 (screenshot unavailable)",
-                                         parse_mode="HTML", reply_markup=reply_markup)
-            return {"chat_id": tid, "message_id": msg.message_id}
-        except Exception:
-            return None
-
-
-async def _dispatch_alert(db, bot, text, reply_markup=None, screenshot_file_id=None):
-    """Send payment alert STRICTLY to the verification group.
-    Returns list of sent message refs (empty if group send failed)."""
-    group_ids, _ = await _payment_destinations(db)
-    refs = []
-    for tid in group_ids:
-        ref = await _send_alert(bot, tid, text, reply_markup, screenshot_file_id)
-        if ref:
-            refs.append(ref)
-    return refs
-
-
-async def _notify_admins_payment(db, bot, order_id, utr, screenshot_file_id):
-    """Notify admins once with full details; later submissions send a short update."""
-    order = await db.orders.find_one({"order_id": order_id})
-    if not order:
-        return
-    pay = await db.payments.find_one({"order_id": order["_id"]})
-    already_notified = bool(pay and pay.get("admin_notified"))
-
-    if already_notified:
-        # Brief update only - no duplicate verification request
-        note = f"📎 Order <code>{order_id}</code>: "
-        note += f"UTR <code>{utr}</code> added.\n" if utr else ""
-        note += "📷 Screenshot added.\n" if screenshot_file_id else ""
-        note += "(Already notified - see Payments menu to review)"
-        await _dispatch_alert(db, bot, note)
-        return
-
-    user = await db.users.find_one({"_id": order["user_id"]})
-    uname = f"@{user.get('username')}" if user and user.get("username") else (user or {}).get("first_name", "?")
-    text = (
-        "🔔 <b>NEW PAYMENT REQUEST</b>\n\n"
-        f"🆔 Order: <code>{order_id}</code>\n"
-        f"👤 Customer: {uname} (<code>{order['telegram_id']}</code>)\n"
-        f"🎮 {_esc(order.get('product_name',''))} | ⏱️ {_esc(order.get('plan_name',''))}\n"
-        f"💰 ₹{order.get('amount',0):.2f}\n"
-        + (f"🏦 UTR: <code>{utr}</code>\n" if utr else "")
-        + ("📷 Screenshot: attached below\n" if screenshot_file_id else "")
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Approve", callback_data=f"ver_ok_{order_id}"),
-        InlineKeyboardButton(text="❌ Reject", callback_data=f"ver_no_{order_id}"),
-    ]])
-
-    # Mark notified BEFORE sending so a retry can't double-send
-    if pay:
-        await db.payments.update_one({"_id": pay["_id"]},
-                                     {"$set": {"admin_notified": True}})
-
-    refs = await _dispatch_alert(db, bot, text, reply_markup=kb,
-                                 screenshot_file_id=screenshot_file_id)
-    # Remember where the first alert landed so delivery can edit it later
-    if refs and pay:
-        await db.payments.update_one(
-            {"_id": pay["_id"]},
-            {"$set": {"notify_chat_id": refs[0]["chat_id"],
-                      "notify_message_id": refs[0]["message_id"]}})
 
 
 # ---------------- My Orders / Key / Files ----------------

@@ -16,11 +16,6 @@ class Config:
     )
 
     # Payment Configuration
-    PAYMENT_MODE: str = os.getenv("PAYMENT_MODE", "manual")  # manual or automatic
-    UPI_ID: str = os.getenv("UPI_ID", "")
-    PAYEE_NAME: str = os.getenv("PAYEE_NAME", "")
-    PAYMENT_VALIDITY_MINUTES: int = int(os.getenv("PAYMENT_VALIDITY_MINUTES", "10"))
-    PAYMENT_INSTRUCTIONS: str = os.getenv("PAYMENT_INSTRUCTIONS", "")
     PAYMENT_VERIFICATION_GROUP_ID: int = int(
         os.getenv("PAYMENT_VERIFICATION_GROUP_ID", "0")
     )
